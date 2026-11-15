@@ -78,7 +78,12 @@ impl PlayMode {
         }
     }
 }
-
+/// Режим сканирования папки: заменить плейлист или добавить в конец.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanMode {
+    Replace,
+    Append,
+}
 /// Главное приложение.
 pub struct MusicPlayerApp {
     audio: AudioController,
@@ -101,7 +106,8 @@ pub struct MusicPlayerApp {
     // Канал получения результата фонового сканирования.
     scan_receiver: Option<Receiver<Result<Vec<Track>, String>>>,
     is_scanning: bool,
-
+    /// Режим текущего сканирования: заменить плейлист или добавить в конец.
+    scan_mode: ScanMode,
     // Состояние перемотки.
     seek_value: f32,
     seek_dragging: bool,
@@ -146,8 +152,10 @@ pub struct MusicPlayerApp {
     last_ui_scale: f32,
     /// Базовый стиль из main.rs (до масштабирования).
     base_style: egui::Style,
-        /// Захвачен ли базовый стиль из main.rs (один раз).
+    /// Захвачен ли базовый стиль из main.rs (один раз).
     base_style_captured: bool,
+    /// Сбросить скролл таблицы на следующем кадре (после replace self.tracks).
+    reset_track_table_scroll: bool,
 
 }
 
@@ -178,7 +186,7 @@ impl MusicPlayerApp {
 
             scan_receiver: None,
             is_scanning: false,
-
+            scan_mode: ScanMode::Replace,
             seek_value: 0.0,
             seek_dragging: false,
             last_seek_time: None,
@@ -198,8 +206,9 @@ impl MusicPlayerApp {
             pending_tray_warning: false,
             pending_zoom: 0.0,
             last_ui_scale: 1.0,
-           base_style: egui::Style::default(),
+            base_style: egui::Style::default(),
             base_style_captured: false,
+            reset_track_table_scroll: false,
         }
     }
 
@@ -403,31 +412,38 @@ impl MusicPlayerApp {
     }
 
     // ---------- Выбор файлов/папок ----------
-
-    /// Выбор папки через системный диалог.
-    fn choose_directory(&mut self) {
-        if self.is_scanning {
-            return;
-        }
-
-        let directory = rfd::FileDialog::new()
-            .set_title("Выберите папку с музыкой")
-            .pick_folder();
-
-        if let Some(directory) = directory {
-            self.start_scan(directory);
-        }
-    }
-
-    /// Выбор отдельных аудиофайлов через системный диалог (с фильтром).
-    fn choose_files(&mut self) {
-        let files = rfd::FileDialog::new()
-            .set_title("Выберите аудиофайлы")
+    /// Выбор файлов и/или папок через системный диалог.
+    /// Файлы добавляются в конец плейлиста.
+    /// Папки сканируются рекурсивно (в фоне) и их треки добавляются в конец.
+    fn choose_files_or_folders(&mut self) {
+        let paths = rfd::FileDialog::new()
+            .set_title("Выберите файлы или папки")
             .add_filter("Аудио", SUPPORTED_AUDIO_EXT)
             .pick_files();
 
-        if let Some(paths) = files {
-            self.add_files(paths);
+        let Some(paths) = paths else {
+            return;
+        };
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut folders: Vec<PathBuf> = Vec::new();
+
+        for path in paths {
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+
+        // Файлы — синхронно (быстро, несколько файлов).
+        if !files.is_empty() {
+            self.add_files(files);
+        }
+
+        // Папки — в фоне, добавляя в конец плейлиста (не заменяя).
+        for folder in folders {
+            self.start_scan_append(folder);
         }
     }
 
@@ -486,6 +502,7 @@ impl MusicPlayerApp {
 
         self.scan_receiver = Some(rx);
         self.is_scanning = true;
+        self.scan_mode = ScanMode::Replace;
 
         self.status = "Сканирование библиотеки...".to_string();
 
@@ -494,8 +511,22 @@ impl MusicPlayerApp {
             let _ = tx.send(result);
         });
     }
+    /// Сканирует папку в фоне и **добавляет** найденные треки в конец
+    /// плейлиста (не заменяет). Используется кнопкой «Добавить».
+    fn start_scan_append(&mut self, directory: PathBuf) {
+        let (tx, rx) = mpsc::channel();
 
-    /// Проверка результата сканирования.
+        self.scan_receiver = Some(rx);
+        self.is_scanning = true;
+        self.scan_mode = ScanMode::Append;
+        self.status = "Сканирование папки...".to_string();
+
+        thread::spawn(move || {
+            let result = scan_directory(&directory);
+            let _ = tx.send(result);
+        });
+    }
+       /// Проверка результата сканирования.
     fn update_scan(&mut self) {
         let result = self
             .scan_receiver
@@ -511,13 +542,23 @@ impl MusicPlayerApp {
                     Ok(tracks) => {
                         let count = tracks.len();
 
-                        self.tracks = tracks;
-                        self.cover_textures.clear();
-                        self.current_cover_texture = None;
-                        self.selected_track = None;
-                        self.current_track = None;
-
-                        self.status = format!("Загружено треков: {}", count);
+                        match self.scan_mode {
+                            ScanMode::Replace => {
+                                self.tracks = tracks;
+                                self.reset_track_table_scroll = true;
+                                self.cover_textures.clear();
+                                self.current_cover_texture = None;
+                                self.selected_track = None;
+                                self.current_track = None;
+                                self.status = format!("Загружено треков: {}", count);
+                            }
+                            ScanMode::Append => {
+                                self.tracks.extend(tracks);
+                                self.reset_track_table_scroll = false;
+                                self.status = format!("Добавлено треков из папки: {}", count);
+                            }
+                        }
+                        self.scan_mode = ScanMode::Replace; // сброс
                     }
                     Err(err) => {
                         self.status = format!("Ошибка сканирования: {}", err);
@@ -533,6 +574,7 @@ impl MusicPlayerApp {
             None => {}
         }
     }
+
 
     // ---------- Отрисовка ----------
 
@@ -565,14 +607,8 @@ impl MusicPlayerApp {
 
                 ui.add_space(18.0 * scale);
 
-                if sidebar_button(ui, SidebarIcon::Folder, "Выбрать папку", 210.0 * scale, scale) {
-                    self.choose_directory();
-                }
-
-                ui.add_space(2.0 * scale);
-
-                if sidebar_button(ui, SidebarIcon::Plus, "Добавить файлы", 210.0 * scale, scale) {
-                    self.choose_files();
+                if sidebar_button(ui, SidebarIcon::Plus, "Добавить", 210.0 * scale, scale) {
+                    self.choose_files_or_folders();
                 }
 
                 ui.add_space(12.0 * scale);
@@ -673,6 +709,12 @@ impl MusicPlayerApp {
     /// вместе с межколоночными промежутками не превышает видимую область.
     fn render_track_table(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+
+        // Одноразовый сброс скролла: если self.tracks только что заменили
+        // (update_scan), позиция скролла могла остаться за пределами новой
+        // коллекции — body.rows не вызовет замыкание. Сбрасываем на этом кадре.
+        let reset_table_scroll = std::mem::take(&mut self.reset_track_table_scroll);
+
         let mut clicked_index: Option<usize> = None;
         let mut double_clicked_index: Option<usize> = None;
         let mut delete_index: Option<usize> = None;
@@ -798,8 +840,12 @@ impl MusicPlayerApp {
                         // нет собственного ui.painter()/ui.max_rect()).
                         let header_line_painter = ui.painter().clone();
 
-                        TableBuilder::new(ui)
-                            .striped(false)
+                        let mut table = TableBuilder::new(ui)
+                            .striped(false);
+                        if reset_table_scroll {
+                            table = table.vertical_scroll_offset(0.0);
+                        }
+                        table
                             // Горизонтальная прокрутка выключена самим TableBuilder;
                             // auto_shrink по X не позволяет таблице расширить область.
                             .auto_shrink([true, false])
