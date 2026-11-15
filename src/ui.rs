@@ -2199,18 +2199,22 @@ fn sidebar_button(ui: &mut egui::Ui, icon: SidebarIcon, label: &str, width: f32,
 
     let text_color = PRIMARY_TEXT;
     let label_rect = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(30.0 * scale, 0.0),
-        rect.right_bottom() - egui::vec2(6.0 * scale, 0.0),
+        egui::pos2(rect.left() + 30.0 * scale, rect.top()),
+        egui::pos2(rect.right() - 6.0 * scale, rect.bottom()),
     );
-    ui.put(
-        label_rect,
-        egui::Label::new(
-            egui::RichText::new(label)
-                .size(18.0 * scale)
-                .color(text_color),
-        )
-        .truncate(),
+    let galley = ui.painter().layout(
+        label.to_string(),
+        egui::FontId::proportional(18.0 * scale),
+        text_color,
+        label_rect.width(),
     );
+    let text_pos = egui::pos2(
+        label_rect.left(),
+        label_rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter()
+        .with_clip_rect(label_rect)
+        .galley(text_pos, galley, text_color);
 
     response.clicked()
 }
