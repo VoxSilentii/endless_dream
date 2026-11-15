@@ -221,7 +221,6 @@ fn main() -> eframe::Result<()> {
     let tray_wake_requests = Arc::clone(&tray_requests);
 
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-        eprintln!("TrayIconEvent: {:?}", event);
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
@@ -250,7 +249,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             // Компактная тёмная тема.
-            let mut style = (*cc.egui_ctx.style()).clone();
+            let mut style = (*cc.egui_ctx.global_style()).clone();
 
             style.spacing.item_spacing = egui::vec2(4.0, 4.0);
             style.spacing.window_margin = egui::Margin::same(6);
@@ -272,7 +271,7 @@ fn main() -> eframe::Result<()> {
 
             // Убираем I-beam курсор при наведении на лейблы.
             style.interaction.selectable_labels = false;
-            cc.egui_ctx.set_style(style);
+            cc.egui_ctx.set_global_style(style);
 
             #[cfg(target_os = "linux")]
             let (tray, show_item_id, quit_item_id) = tray_setup;

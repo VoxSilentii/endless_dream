@@ -4,10 +4,7 @@ use crate::library::{self as library, format_duration, scan_directory, Track};
 use crate::TrayHandle;
 
 use eframe::egui;
-use tray_icon::{
-    menu::{MenuEvent, MenuId},
-    MouseButton, MouseButtonState, TrayIconEvent,
-};
+use tray_icon::menu::MenuId;
 use egui_extras::{Column, TableBuilder};
 
 use std::collections::HashMap;
@@ -138,9 +135,23 @@ pub struct MusicPlayerApp {
     tray_enabled: bool,
     /// Открыто ли окно настроек.
     show_settings: bool,
+
     /// Нужно ли показать предупреждение о ЦП перед включением трея.
     pending_tray_warning: bool,
+
+    /// Накопленная необработанная дельта зума (в лог-шкале).
+    pending_zoom: f32,
+
+    /// Последний применённый ui_scale (чтобы не пересчитывать стиль каждый кадр).
+    last_ui_scale: f32,
+    /// Базовый стиль из main.rs (до масштабирования).
+    base_style: egui::Style,
+        /// Захвачен ли базовый стиль из main.rs (один раз).
+    base_style_captured: bool,
+
 }
+
+
 impl MusicPlayerApp {
            pub fn new(
         tray: Option<TrayHandle>,
@@ -185,6 +196,10 @@ impl MusicPlayerApp {
             tray_enabled: false,
             show_settings: false,
             pending_tray_warning: false,
+            pending_zoom: 0.0,
+            last_ui_scale: 1.0,
+           base_style: egui::Style::default(),
+            base_style_captured: false,
         }
     }
 
@@ -522,20 +537,19 @@ impl MusicPlayerApp {
     // ---------- Отрисовка ----------
 
     /// Левый сайдбар: название приложения и кнопки выбора музыкальных файлов.
-    fn render_sidebar(&mut self, ctx: &egui::Context) {
+     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
         let scale = self.ui_scale.clamp(0.5, 2.0);
-
-        egui::SidePanel::left("sidebar")
-            .exact_width(220.0 * scale)
+        egui::Panel::left("sidebar")
+            .exact_size(220.0 * scale)
             .resizable(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(SIDEBAR_BG)
                     .stroke(egui::Stroke::new(1.0_f32 * scale, BORDER))
                     .inner_margin(egui::Margin::symmetric((14.0 * scale) as i8, (16.0 * scale) as i8)),
             )
-            .show(ctx, |ui| {
-                scale_text_styles(ui, scale);
+            .show_inside(ui, |ui| {
+ 
 
                 ui.label(
                     egui::RichText::new("Rust Player")
@@ -657,7 +671,8 @@ impl MusicPlayerApp {
     /// название забирает остаток через Column::remainder(). На очень узких
     /// окнах все колонки пропорционально сжимаются, поэтому сумма их ширин
     /// вместе с межколоночными промежутками не превышает видимую область.
-    fn render_track_table(&mut self, ctx: &egui::Context) {
+    fn render_track_table(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let mut clicked_index: Option<usize> = None;
         let mut double_clicked_index: Option<usize> = None;
         let mut delete_index: Option<usize> = None;
@@ -672,7 +687,7 @@ impl MusicPlayerApp {
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(16, 14, 25))
                     .stroke(egui::Stroke::NONE)
                     .inner_margin(egui::Margin {
@@ -682,8 +697,7 @@ impl MusicPlayerApp {
     bottom: 0,
 }),
             )
-            .show(ctx, |ui| {
-                scale_text_styles(ui, scale);
+            .show_inside(ui, |ui| {
 
                 // Пиксельные звёзды рисуются под таблицей: координаты стабильны,
                 // меняется только их яркость, а комета движется по времени.
@@ -1019,7 +1033,7 @@ impl MusicPlayerApp {
             });
         // Ограничиваем кэш обложек до 100 элементов.
         // Если превышает — удаляем самый старый (LRU).
-        const MAX_COVERS: usize = 100;
+        const MAX_COVERS: usize = 20;
         if self.cover_textures.len() > MAX_COVERS {
             let mut oldest_key = None;
             let mut oldest_time = Instant::now();
@@ -1043,31 +1057,31 @@ impl MusicPlayerApp {
             self.selected_track = Some(index);
         }
         if let Some(index) = double_clicked_index {
-            self.play_track(ctx, index);
+            self.play_track(&ctx, index);
         }
     }
 
     /// Нижняя панель: информация о треке слева, транспорт строго по центру,
     /// громкость справа. Все три зоны рассчитываются по текущей ширине окна.
-    fn render_control_panel(&mut self, ctx: &egui::Context) {
+    fn render_control_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let audio_state = self.audio.get_state();
         let scale = self.ui_scale.clamp(0.5, 2.0);
 
-        egui::TopBottomPanel::bottom("control_panel")
-            .exact_height(120.0 * scale)
+        egui::Panel::bottom("control_panel")
+            .exact_size(120.0 * scale)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(CONTROL_BG)
                     .stroke(egui::Stroke::new(1.0_f32 * scale, BORDER))
                    .inner_margin(egui::Margin {
-    left: (6.0 * scale) as i8,
-    right: (6.0 * scale) as i8,
-    top: (8.0 * scale) as i8,
-    bottom: 0,
+        left: (6.0 * scale) as i8,
+        right: (6.0 * scale) as i8,
+        top: (8.0 * scale) as i8,
+            bottom: 0,
 }),
             )
-            .show(ctx, |ui| {
-                scale_text_styles(ui, scale);
+            .show_inside(ui, |ui| {
 
                 let available_width = ui.available_width().max(1.0);
                 let content_height = ui.available_height().max(1.0);
@@ -1252,7 +1266,7 @@ impl MusicPlayerApp {
                             center.add_space(10.0 * layout_scale);
 
                             if skip_button(center, true, 32.0 * layout_scale) {
-                                self.next_track(ctx);
+                                self.next_track(&ctx);
                             }
 
                             center.add_space(4.0 * layout_scale);
@@ -1263,16 +1277,16 @@ impl MusicPlayerApp {
                                 } else if audio_state.is_paused {
                                     self.audio.send(AudioCommand::Resume);
                                 } else if let Some(index) = self.selected_track {
-                                    self.play_track(ctx, index);
+                                    self.play_track(&ctx, index);
                                 } else if !self.tracks.is_empty() {
-                                    self.play_track(ctx, 0);
+                                    self.play_track(&ctx, 0);
                                 }
                             }
 
                             center.add_space(4.0 * layout_scale);
 
                             if skip_button(center, false, 32.0 * layout_scale) {
-                                self.prev_track(ctx);
+                                self.prev_track(&ctx);
                             }
                         },
                     );
@@ -1321,18 +1335,20 @@ ui.allocate_ui_with_layout(
 }
 
 impl eframe::App for MusicPlayerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.update(&ctx, frame);
-    }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Один раз сохраняем базовый стиль из main.rs (после set_style).
+        if !self.base_style_captured {
+            self.base_style = (*ctx.style()).clone();
+            self.base_style_captured = true;
+        }
+
         if let Ok(mut wake_ctx) = self.wake_ctx.lock() {
             *wake_ctx = Some(ctx.clone());
         }
-               
 
-            let (want_show, _want_quit) = self
+        let (want_show, _want_quit) = self
             .tray_requests
             .lock()
             .map(|mut r| {
@@ -1341,72 +1357,74 @@ impl eframe::App for MusicPlayerApp {
                 v
             })
             .unwrap_or((false, false));
-// update() не делает ранний выход: он крутится, пока жив процесс, даже
-// когда окно скрыто в трей. В eframe 0.34 связка Visible(false)/true
-// работает корректно (INVISIBLE_WINDOW_REPAINT_INTERVAL), белого экрана
-// при восстановлении нет.
 
-// Крестик.
-let close_requested = ctx.input(|i| i.viewport().close_requested());
-if close_requested && self.tray.is_some() && self.tray_enabled {
-    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-}
-// Если tray_enabled == false, ничего не делаем: close_requested не отменяется,
-// и eframe/winit сами корректно закрывают окно и процесс.
-
-// «Показать» из трея (ЛКМ или пункт «Показать»): request_repaint уже
-// сделан в обработчиках main.rs. Здесь выводим окно из скрытого
-// состояния и фокусируем — в eframe 0.34 Visible(false)/true работают
-// корректно, белого экрана нет.
-if want_show {
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-}
-
-self.render_settings_window(ctx);
-
-
-        self.ensure_fonts_loaded(ctx);
-
-        // Ctrl + колесо меняет масштаб ровно на 0.05 за один шаг колеса.
-        // egui передаёт Ctrl+Wheel как Event::Zoom, доступный через zoom_delta().
-        // Одновременно очищаем scroll delta, чтобы ScrollArea/таблица не
-        // прокручивались при зажатом Ctrl на backend'ах, передающих оба delta.
-        let (ctrl_held, zoom_delta) = ctx.input(|i| (i.modifiers.ctrl, i.zoom_delta()));
-        if ctrl_held {
-            if zoom_delta > 1.0001 {
-                self.ui_scale = (self.ui_scale + 0.05).clamp(0.5, 2.0);
-            } else if zoom_delta < 0.9999 {
-                self.ui_scale = (self.ui_scale - 0.05).clamp(0.5, 2.0);
-            }
-
-            ctx.input_mut(|i| {
-    i.smooth_scroll_delta = egui::Vec2::ZERO;
-});
+        // Крестик.
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && self.tray.is_some() && self.tray_enabled {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
+        if want_show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        self.render_settings_window(&ctx);
+        self.ensure_fonts_loaded(&ctx);
+ 
+
+                let zoom_delta = ctx.input(|i| i.zoom_delta());
+        if zoom_delta != 1.0 {
+            self.pending_zoom += zoom_delta.ln();
+            let step_ln = 1.05_f32.ln();
+            let steps = (self.pending_zoom / step_ln).trunc();
+            if steps != 0.0 {
+                self.ui_scale = (self.ui_scale + steps * 0.05).clamp(0.5, 2.0);
+                self.pending_zoom -= steps * step_ln;
+            }
+        }
         self.update_scan();
+
 
         let audio_state = self.audio.get_state();
         if let Some(error) = &audio_state.error {
             self.status = error.clone();
         }
-        self.check_track_finished(ctx, &audio_state);
+        self.check_track_finished(&ctx, &audio_state);
+// Правка А: пересчитываем стиль только при изменении ui_scale,
+        // а не каждый кадр. base_style — кастомный стиль из main.rs.
 
-        // Нижняя строка состояния удалена.
-        self.render_sidebar(ctx);
-        self.render_control_panel(ctx);
-        self.render_track_table(ctx);
+if (self.ui_scale - self.last_ui_scale).abs() > 0.0001 {
+    let mut style = self.base_style.clone();
+    for font in style.text_styles.values_mut() {
+        font.size *= self.ui_scale;
+    }
+    style.spacing.item_spacing *= self.ui_scale;
+    style.spacing.button_padding *= self.ui_scale;
+    style.spacing.interact_size *= self.ui_scale;
+    style.spacing.slider_width *= self.ui_scale;
+    ctx.set_style(style);
+    self.last_ui_scale = self.ui_scale;
+}
+        self.render_sidebar(ui);
+        self.render_control_panel(ui);
+        self.render_track_table(ui);
 
-        // При скрытом/свёрнутом окне опрашиваем tray-события раз в секунду,
-        // не поддерживая постоянную перерисовку в фоне.
-        let is_visible = ctx.input(|i| !i.viewport().minimized.unwrap_or(false));
-        ctx.request_repaint_after(if is_visible {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_millis(1000)
+                let (visible, minimized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.visible().unwrap_or(true), vp.minimized.unwrap_or(false))
         });
+        let window_shown = visible && !minimized;
+        let audio_active = audio_state.is_playing || audio_state.is_paused;
+        let repaint_ms = if !window_shown {
+            1000
+        } else if audio_active {
+            16
+        } else {
+            33
+        };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
     }
 }
 
@@ -1574,17 +1592,17 @@ fn paint_pixel_stars(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         let y = rect.top() + rect.height() * y_ratio;
 
         for (row, line) in mask.iter().enumerate() {
-            let chars: Vec<char> = line.chars().collect();
+            let bytes = line.as_bytes();
             let mut col = 0;
 
-            while col < chars.len() {
-                let ch = chars[col];
+            while col < bytes.len() {
+                let ch = bytes[col];
                 let color = match ch {
-                    '1' => egui::Color32::from_rgba_unmultiplied(10, 15, 25, 40),
-                    '2' => egui::Color32::from_rgba_unmultiplied(35, 40, 70, 70),
-                    '3' => egui::Color32::from_rgba_unmultiplied(60, 65, 110, 80),
-                    '4' => egui::Color32::from_rgba_unmultiplied(70, 50, 100, 60),
-                    '5' => egui::Color32::from_rgba_unmultiplied(130, 140, 200, 100),
+                    b'1' => egui::Color32::from_rgba_unmultiplied(10, 15, 25, 40),
+                    b'2' => egui::Color32::from_rgba_unmultiplied(35, 40, 70, 70),
+                    b'3' => egui::Color32::from_rgba_unmultiplied(60, 65, 110, 80),
+                    b'4' => egui::Color32::from_rgba_unmultiplied(70, 50, 100, 60),
+                    b'5' => egui::Color32::from_rgba_unmultiplied(130, 140, 200, 100),
                     _ => {
                         col += 1;
                         continue;
@@ -1592,9 +1610,10 @@ fn paint_pixel_stars(painter: &egui::Painter, rect: egui::Rect, time: f64) {
                 };
 
                 let start = col;
-                while col < chars.len() && chars[col] == ch {
+                while col < bytes.len() && bytes[col] == ch {
                     col += 1;
                 }
+                // ...
                 let run_len = col - start;
 
                 let px = x + start as f32 * pixel_size;
@@ -1721,21 +1740,7 @@ fn paint_pixel_comet(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     painter.rect_filled(core_rect, egui::CornerRadius::ZERO, egui::Color32::WHITE);
 }
 
-/// Масштабирует системные размеры текста внутри конкретной панели, не меняя
-/// глобальный стиль приложения.
-fn scale_text_styles(ui: &mut egui::Ui, scale: f32) {
-    let style = ui.style_mut();
-    for font_id in style.text_styles.values_mut() {
-        font_id.size *= scale;
-    }
 
-    // Масштабируем также стандартные размеры интерактивных элементов,
-    // чтобы системный Slider и межэлементные интервалы соответствовали Zoom.
-    style.spacing.item_spacing *= scale;
-    style.spacing.button_padding *= scale;
-    style.spacing.interact_size *= scale;
-    style.spacing.slider_width *= scale;
-}
 
 /// Текст заголовка таблицы; использует Pixelify Sans из семейства Proportional.
 fn table_header_text(label: &str, scale: f32) -> egui::RichText {
