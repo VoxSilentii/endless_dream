@@ -133,17 +133,31 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                                     }
                                 }
                                 Err(err) => {
-                                    set_error(&shared_state, format!("Ошибка декодирования: {err}"));
+                                    let ext = path
+                                        .extension()
+                                        .map(|e| e.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "?".to_string());
+                                    set_error(
+                                        &shared_state,
+                                        format!(
+                                            "Ошибка декодирования '{}' (.{ext}): {err}",
+                                            path.display()
+                                        ),
+                                    );
                                 }
                             }
                         }
                         Err(err) => {
-                            set_error(&shared_state, format!("Ошибка открытия файла: {err}"));
+                            set_error(
+                                &shared_state,
+                                format!("Ошибка открытия файла '{}': {err}", path.display()),
+                            );
                         }
                     }
                 }
 
                 AudioCommand::Pause => {
+
                     if let Some(ref current_sink) = sink {
                         current_sink.pause();
                         if let Ok(mut state) = shared_state.lock() {

@@ -396,6 +396,11 @@ impl MusicPlayerApp {
         if finished {
             self.advance_after_finish(ctx);
         }
+        // Если текущий трек не играет из-за ошибки — переключаем на следующий.
+if audio_state.error.is_some() && self.current_track.is_some() {
+    self.advance_after_finish(ctx);
+    return;
+}
     }
 
     // ---------- Выбор файлов/папок ----------
@@ -827,7 +832,9 @@ impl MusicPlayerApp {
         // за кадр, даже при больших библиотеках.
         let tracks = &self.tracks;
         let cover_textures = &mut self.cover_textures;
-
+        const MAX_COVER_DECODES_PER_FRAME: usize = 4;
+let mut cover_decodes_this_frame: usize = 0;
+let cover_decodes_this_frame = &mut cover_decodes_this_frame;
         let panel_response = egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
@@ -1013,7 +1020,7 @@ impl MusicPlayerApp {
                                     let is_selected = selected_track == Some(index);
                                     row.set_selected(is_selected);
 
-                                    row.col(|ui| {
+                                                                        row.col(|ui| {
                                         ui.style_mut().interaction.selectable_labels = false;
                                         ui.with_layout(
                                             egui::Layout::centered_and_justified(
@@ -1022,14 +1029,18 @@ impl MusicPlayerApp {
                                             |ui| {
                                                 // Сначала ищем без клонирования пути — на каждом кадре это экономит аллокации.
                                                 let mut cover_handle = cover_textures.get(&track.path).and_then(|(tex, _)| tex.clone());
-                                                
-                                                if cover_handle.is_none() && !cover_textures.contains_key(&track.path) {
+
+                                                if cover_handle.is_none()
+                                                    && !cover_textures.contains_key(&track.path)
+                                                    && *cover_decodes_this_frame < MAX_COVER_DECODES_PER_FRAME
+                                                {
                                                     // Если обложки нет в кэше, грузим её.
                                                     // Декодируем только 64x64, чтобы не жрать память.
                                                     let tex = library::read_cover(&track.path)
                                                         .and_then(|bytes| decode_pixel_cover(ui.ctx(), &bytes));
                                                     cover_textures.insert(track.path.clone(), (tex.clone(), Instant::now()));
                                                     cover_handle = tex;
+                                                    *cover_decodes_this_frame += 1;
                                                 } else {
                                                     // Обновляем время последнего доступа (для LRU).
                                                     if let Some((_, last_access)) = cover_textures.get_mut(&track.path) {
@@ -1177,20 +1188,21 @@ impl MusicPlayerApp {
 
         // Ограничиваем кэш обложек до 100 элементов.
         // Если превышает — удаляем самый старый (LRU).
-        const MAX_COVERS: usize = 20;
-        if self.cover_textures.len() > MAX_COVERS {
-            let mut oldest_key = None;
-            let mut oldest_time = Instant::now();
-            for (k, (_, t)) in &self.cover_textures {
-                if *t < oldest_time {
-                    oldest_time = *t;
-                    oldest_key = Some(k.clone());
-                }
-            }
-            if let Some(k) = oldest_key {
-                self.cover_textures.remove(&k);
-            }
+const MAX_COVERS: usize = 20;
+while self.cover_textures.len() > MAX_COVERS {
+    let oldest_key = self
+        .cover_textures
+        .iter()
+        .min_by_key(|(_, (_, last_access))| *last_access)
+        .map(|(k, _)| k.clone());
+
+    match oldest_key {
+        Some(k) => {
+            self.cover_textures.remove(&k);
         }
+        None => break,
+    }
+}
         // Все заимствования таблицы завершены — теперь можно менять self.
         if let Some(index) = delete_index {
             self.delete_track(index);
@@ -1687,18 +1699,41 @@ impl Drop for MusicPlayerApp {
 ///    оставались чёткими, а не размазывались билинейной фильтрацией.
 ///
 /// Вызывается при смене текущего трека и лениво для видимых строк таблицы.
+/// Жёсткий потолок на сырые байты встроенной обложки ДО декодирования.
+/// Легитимные обложки для плеера с окном 64x64/128x128 крайне редко
+/// весят больше нескольких МБ; файлы тяжелее — почти всегда не обложка,
+/// а, например, ошибочно вложенный буклет/скан — такие декодировать
+/// в память целиком не нужно.
+const MAX_COVER_BYTES: usize = 8 * 1024 * 1024; // 8 МБ
+
 fn decode_pixel_cover(ctx: &egui::Context, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    if bytes.len() > MAX_COVER_BYTES {
+        eprintln!(
+            "Обложка пропущена: {} байт превышает лимит {MAX_COVER_BYTES}",
+            bytes.len()
+        );
+        return None;
+    }
+
+    // ВНИМАНИЕ: image::load_from_memory декодирует картинку в ПОЛНОМ
+    // исходном разрешении (3000x3000 JPEG -> ~36 МБ RGBA-буфер), и
+    // только после этого мы уменьшаем её до 64x64. Это источник
+    // кратковременных пиков ОЗУ. `image` 0.24 не умеет "scaled decode"
+    // (частичное/уменьшенное декодирование на лету для JPEG) без
+    // дополнительных крейтов (например, turbojpeg с DCT-скейлингом) —
+    // проверь по docs.rs/image/0.24, появилась ли такая возможность,
+    // прежде чем усложнять это место.
     let decoded = image::load_from_memory(bytes).ok()?;
     let rgba = decoded.to_rgba8();
-    // Уменьшаем до 64x64. В таблице и нижней панели этого хватает с запасом.
     let tiny = image::imageops::resize(&rgba, 64, 64, image::imageops::FilterType::Nearest);
+    drop(rgba);
+    drop(decoded);
 
     let size = [tiny.width() as usize, tiny.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, tiny.as_raw());
 
     Some(ctx.load_texture("track_cover", color_image, egui::TextureOptions::NEAREST))
 }
-
 // ================= Кастомные виджеты (Painter) =================
 
 /// Стабильный целочисленный hash для детерминированного псевдослучайного фона.

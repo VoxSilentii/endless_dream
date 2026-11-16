@@ -348,19 +348,22 @@ fn main() -> eframe::Result<()> {
                     egui::FontData::from_static(PIXEL_FONT_BYTES).into(),
                 );
 
-                let proportional = fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default();
-                proportional.clear();
-                proportional.push(PIXEL_FONT_NAME.to_owned());
+// Кастомный шрифт — ПЕРВЫЙ в списке (значит, используется, пока в нём
+// есть нужный глиф), но дефолтные шрифты egui НЕ удаляем: они остаются
+// в конце списка как фолбэк для кириллицы/иероглифов/эмодзи и т.п.,
+// которых может не быть в пиксельном шрифте. Раньше `.clear()` стирал
+// этот фолбэк — отсюда "пропадающие" кириллические названия треков.
+let proportional = fonts
+    .families
+    .entry(egui::FontFamily::Proportional)
+    .or_default();
+proportional.insert(0, PIXEL_FONT_NAME.to_owned());
 
-                let monospace = fonts
-                    .families
-                    .entry(egui::FontFamily::Monospace)
-                    .or_default();
-                monospace.clear();
-                monospace.push(PIXEL_FONT_NAME.to_owned());
+let monospace = fonts
+    .families
+    .entry(egui::FontFamily::Monospace)
+    .or_default();
+monospace.insert(0, PIXEL_FONT_NAME.to_owned());
 
                 cc.egui_ctx.set_fonts(fonts);
             }
