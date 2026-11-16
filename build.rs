@@ -12,7 +12,7 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_icon("assets/icon.ico");
         res.set("ProductName", "Endless Dream");
-        res.set("FileDescription", "Endless Dream — музыкальный плеер");
+        res.set("FileDescription", "Endless Dream");
 
         // Отсутствие rc.exe/Windows SDK не должно валить сборку: играет
         // роль только оформление exe-файла, само приложение от него не
