@@ -215,6 +215,11 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                 if empty {
                     state.is_playing = false;
                     state.is_paused = false;
+                    // Если трек доиграл до конца, ставим позицию ровно в длительность,
+                    // чтобы UI точно понял, что пора переключать трек.
+                    if current_duration > Duration::ZERO && position > Duration::ZERO {
+                        state.position = current_duration;
+                    }
                 }
             }
         }

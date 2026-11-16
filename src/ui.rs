@@ -4,7 +4,6 @@ use crate::library::{self as library, format_duration, scan_directory, Track};
 use crate::TrayHandle;
 use crate::state::{self, SavedState};
 use eframe::egui;
-use tray_icon::menu::MenuId;
 use egui_extras::{Column, TableBuilder};
 
 use std::collections::HashMap;
@@ -14,15 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
  
-/// Pixelify Sans хранится в проекте под прежним именем файла DepartureMono.otf.
-/// Файл подключается непосредственно в бинарник через include_bytes!.
-const PIXEL_FONT_BYTES: &[u8] = include_bytes!("../assets/DepartureMono.otf");
-const PIXEL_FONT_NAME: &str = "Pixelify Sans";
-
 // ---------- Космическая палитра ----------
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 150, 255);
-/// Основная область — глубокий сине-фиолетовый, как ночное небо.
-const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(18, 16, 28);
 /// Панель управления немного отделена от основного фона.
 const CONTROL_BG: egui::Color32 = egui::Color32::from_rgb(14, 15, 27);
 const SIDEBAR_BG: egui::Color32 = egui::Color32::from_rgb(10, 10, 15);
@@ -93,8 +85,6 @@ pub struct MusicPlayerApp {
 
     /// Держит системный трей живым (на Linux — GTK-поток, на остальных платформах — TrayIcon).
     tray: Option<TrayHandle>,
-    show_item_id: Option<MenuId>,
-    quit_item_id: Option<MenuId>,
     /// Масштаб интерфейса, изменяемый сочетанием Ctrl + колесо мыши.
     ui_scale: f32,
 
@@ -115,8 +105,6 @@ pub struct MusicPlayerApp {
     /// не срабатывало повторно, пока аудио-поток ещё не успел обновить
     /// состояние (он опрашивается раз в ~100мс).
     last_track_switch: Instant,
-
-    fonts_loaded: bool,
 
     /// Пиксельная обложка текущего трека (64x64 → 128x128, Nearest).
     current_cover_texture: Option<egui::TextureHandle>,
@@ -178,8 +166,6 @@ impl MusicPlayerApp {
               pub fn new(
         tray: Option<TrayHandle>,
         tray_requests: Arc<Mutex<(bool, bool)>>,
-        show_item_id: Option<MenuId>,
-        quit_item_id: Option<MenuId>,
         wake_ctx: Arc<Mutex<Option<egui::Context>>>,
     ) -> Self {
         // Быстрая синхронная загрузка (крошечный JSON) — а вот сами треки
@@ -200,7 +186,7 @@ impl MusicPlayerApp {
             Some(rx)
         });
 
-        let mut app = Self {
+        let app = Self {
             audio: AudioController::new(),
 
             tracks: Vec::new(),
@@ -211,8 +197,6 @@ impl MusicPlayerApp {
             status: "Готов".to_string(),
             volume: saved_state.as_ref().map(|s| s.volume).unwrap_or(0.7),
             tray,
-            show_item_id,
-            quit_item_id,
             ui_scale: saved_state.as_ref().map(|s| s.ui_scale).unwrap_or(1.0),
 
             scan_receiver: None,
@@ -225,7 +209,6 @@ impl MusicPlayerApp {
             play_mode: PlayMode::Normal,
             last_track_switch: Instant::now() - Duration::from_secs(1),
 
-            fonts_loaded: true,
             current_cover_texture: None,
             cover_textures: HashMap::new(),
             wake_ctx,
@@ -256,48 +239,6 @@ impl MusicPlayerApp {
         app.audio.send(AudioCommand::SetVolume(initial_volume));
         
         app
-    }
-
-    // ---------- Шрифты ----------
-
-    /// Грузим кастомный шрифт один раз, на первом кадре. Доступа к
-    /// CreationContext здесь нет (MusicPlayerApp::new() его не принимает),
-    /// но egui::Context доступен прямо в update(), так что делаем это лениво.
-    fn ensure_fonts_loaded(&mut self, ctx: &egui::Context) {
-        if self.fonts_loaded {
-            return;
-        }
-        self.fonts_loaded = true;
-
-        let mut fonts = egui::FontDefinitions::default();
-                fonts.font_data.insert(
-            PIXEL_FONT_NAME.to_owned(),
-            egui::FontData::from_static(PIXEL_FONT_BYTES)
-                .tweak(egui::FontTweak {
-                    scale: 1.0,
-                    y_offset_factor: 0.0,
-                    y_offset: 0.0,
-                    ..Default::default()
-                })
-                .into(),
-        );
-
-        // Очищаем оба семейства от системных шрифтов и оставляем ТОЛЬКО наш.
-        let proportional = fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default();
-        proportional.clear();
-        proportional.push(PIXEL_FONT_NAME.to_owned());
-
-        let monospace = fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default();
-        monospace.clear();
-        monospace.push(PIXEL_FONT_NAME.to_owned());
-
-        ctx.set_fonts(fonts);
     }
 
     // ---------- Воспроизведение ----------
@@ -681,7 +622,7 @@ impl MusicPlayerApp {
  
 
                 ui.label(
-                    egui::RichText::new("Rust Player")
+                    egui::RichText::new("Endless\nDream")
                         .size(28.0 * scale)
                         .color(PRIMARY_TEXT),
                 );
@@ -752,7 +693,7 @@ impl MusicPlayerApp {
         // Делаем заголовки окон светлыми (PRIMARY_TEXT).
         // Это меняет цвет для всего noninteractive-текста на кадр,
         // но в нашем приложении он и так светлый — вреда нет.
-        ctx.style_mut(|style| {
+        ctx.global_style_mut(|style| {
             style.visuals.widgets.noninteractive.fg_stroke.color = PRIMARY_TEXT;
         });
 
@@ -849,7 +790,7 @@ impl MusicPlayerApp {
 
                     ui.label(
                         "При сворачивании в трей плеер не закрывается, а остаётся \
-                         работать в фоне. Потребление ОЗУ может вырасти. \
+                         работать в фоне. Потребление ОЗУ может возрасти. \
                          Продолжить?",
                     );
                     ui.add_space(8.0);
@@ -1545,7 +1486,20 @@ if volume_response.dragged() || volume_response.clicked() {
 impl eframe::App for MusicPlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-
+        // Гасим белые tooltip'ы: тёмный фон в стиле приложения.
+        // В egui 0.34 tooltip берёт цвета из Style::visuals, но не все
+        // переопределения из main.rs долетают до него (Frame::popup
+        // использует отдельные поля). Меняем глобальный стиль на кадр.
+        ctx.global_style_mut(|style| {
+            style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 10, 15); // SIDEBAR_BG
+            style.visuals.window_fill = egui::Color32::from_rgb(10, 10, 15);
+            style.visuals.window_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(35, 43, 65)); // BORDER
+            style.visuals.widgets.noninteractive.fg_stroke.color =
+                egui::Color32::from_rgb(225, 235, 250); // PRIMARY_TEXT
+            style.visuals.widgets.inactive.fg_stroke.color =
+                egui::Color32::from_rgb(225, 235, 250);
+        });
     // Фон на случай первого кадра/ресайза, пока sidebar_rect/central_rect
         // ещё не обновились. Сами панели красят себя сами и полностью
         // покрывают max_rect() (eframe::App::ui отдаёт Ui БЕЗ margin и фона
@@ -2397,20 +2351,24 @@ fn draw_music_note_icon(
     color: egui::Color32,
 ) {
     let unit = (size / 12.0).max(1.0);
+    
+    // Сдвигаем всю иконку влево, чтобы она была визуально по центру.
+    // Без этого штиль и флажок уводят ноту вправо.
+    let offset = center - egui::vec2(unit * 1.0, 0.0);
 
     // Вертикальный штиль и верхняя флажковая часть.
     let stem = egui::Rect::from_min_size(
-        center + egui::vec2(unit * 2.0, -unit * 5.0),
+        offset + egui::vec2(unit * 2.0, -unit * 5.0),
         egui::vec2(unit * 1.5, unit * 8.0),
     );
     painter.rect_filled(stem, egui::CornerRadius::ZERO, color);
 
     let flag_top = egui::Rect::from_min_size(
-        center + egui::vec2(unit * 3.5, -unit * 5.0),
+        offset + egui::vec2(unit * 3.5, -unit * 5.0),
         egui::vec2(unit * 4.0, unit * 1.5),
     );
     let flag_mid = egui::Rect::from_min_size(
-        center + egui::vec2(unit * 5.0, -unit * 3.5),
+        offset + egui::vec2(unit * 5.0, -unit * 3.5),
         egui::vec2(unit * 2.5, unit * 1.5),
     );
     painter.rect_filled(flag_top, egui::CornerRadius::ZERO, color);
@@ -2418,7 +2376,7 @@ fn draw_music_note_icon(
 
     // Квадратная головка ноты.
     let head = egui::Rect::from_min_size(
-        center + egui::vec2(-unit * 3.5, unit * 1.5),
+        offset + egui::vec2(-unit * 3.5, unit * 1.5),
         egui::vec2(unit * 5.0, unit * 3.0),
     );
     painter.rect_filled(head, egui::CornerRadius::ZERO, color);

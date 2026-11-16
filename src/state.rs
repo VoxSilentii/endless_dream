@@ -5,10 +5,14 @@
 //! флаг «сворачивать в трей» и масштаб интерфейса.
 //!
 //! Путь к файлу состояния:
-//!   - Windows: %APPDATA%\RustMusicPlayer\state.json
-//!   - Linux:   $XDG_CONFIG_HOME/rust_music_player/state.json
-//!              (обычно ~/.config/rust_music_player/state.json)
-//!   - macOS:   ~/Library/Application Support/rust_music_player/state.json
+//!   - Windows: %APPDATA%\EndlessDream\state.json
+//!   - Linux:   $XDG_CONFIG_HOME/endless_dream/state.json
+//!              (обычно ~/.config/endless_dream/state.json)
+//!   - macOS:   ~/Library/Application Support/endless_dream/state.json
+//!
+//! При первом запуске после переименования плеера состояние читается из
+//! старого каталога (RustMusicPlayer / rust_music_player), чтобы не
+//! потерять плейлист. Дальше оно сохраняется уже по новому пути.
 //!
 //! Намеренно взят `directories::BaseDirs`, а НЕ `ProjectDirs`: по докам
 //! directories 6.0.0 `ProjectDirs::config_dir()` на Windows добавляет ещё
@@ -19,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::library::{self, Track};
 
@@ -51,18 +55,36 @@ fn default_ui_scale() -> f32 {
 /// На Windows принято PascalCase, на Linux/macOS — snake_case.
 fn app_dir_name() -> &'static str {
     if cfg!(target_os = "windows") {
+        "EndlessDream"
+    } else {
+        "endless_dream"
+    }
+}
+
+/// Прежнее имя папки — до переименования плеера.
+fn legacy_app_dir_name() -> &'static str {
+    if cfg!(target_os = "windows") {
         "RustMusicPlayer"
     } else {
         "rust_music_player"
     }
 }
 
-/// Полный путь к файлу состояния. `None`, если не удалось определить
-/// домашний каталог пользователя (headless-система без $HOME и т.п.) —
-/// это не ошибка, просто сохранение/загрузка станут no-op.
-fn state_file_path() -> Option<PathBuf> {
+/// Полный путь к файлу состояния в заданной папке приложения.
+/// `None`, если не удалось определить домашний каталог пользователя
+/// (headless-система без $HOME и т.п.) — это не ошибка, просто
+/// сохранение/загрузка станут no-op.
+fn state_file_path_in(app_dir: &str) -> Option<PathBuf> {
     let base_dirs = directories::BaseDirs::new()?;
-    Some(base_dirs.config_dir().join(app_dir_name()).join("state.json"))
+    Some(base_dirs.config_dir().join(app_dir).join("state.json"))
+}
+
+fn state_file_path() -> Option<PathBuf> {
+    state_file_path_in(app_dir_name())
+}
+
+fn legacy_state_file_path() -> Option<PathBuf> {
+    state_file_path_in(legacy_app_dir_name())
 }
 
 /// Загружает состояние из файла.
@@ -70,9 +92,22 @@ fn state_file_path() -> Option<PathBuf> {
 /// Возвращает `None` (не паникует и не возвращает `Result`), если файла
 /// ещё нет, он пустой, JSON битый/несовместимый, или путь не определён.
 /// Вызывающий код в этих случаях просто стартует с чистого листа.
+///
+/// Если состояния по новому пути нет, пробуем старый каталог — так
+/// плейлист переживает переименование приложения.
 pub fn load_state() -> Option<SavedState> {
-    let path = state_file_path()?;
-    let data = fs::read_to_string(&path).ok()?;
+    if let Some(path) = state_file_path() {
+        if let Some(state) = load_state_from(&path) {
+            return Some(state);
+        }
+    }
+
+    let legacy_path = legacy_state_file_path()?;
+    load_state_from(&legacy_path)
+}
+
+fn load_state_from(path: &Path) -> Option<SavedState> {
+    let data = fs::read_to_string(path).ok()?;
 
     if data.trim().is_empty() {
         return None;
@@ -82,7 +117,7 @@ pub fn load_state() -> Option<SavedState> {
         Ok(state) => Some(state),
         Err(error) => {
             eprintln!(
-                "Файл состояния '{}' повреждён или несовместим ({error}) — игнорирую, запускаюсь с чистого листа.",
+                "Файл состояния '{}' повреждён или несовместим ({error}) — игнорирую.",
                 path.display()
             );
             None

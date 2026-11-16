@@ -20,6 +20,8 @@ use tray_icon::{
 use ui::MusicPlayerApp;
  
 const TRAY_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/tray_icon.png");
+/// Иконка окна и панели задач (PNG рядом с исходниками).
+const APP_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png");
 
 /// Возвращает сохранённый egui::Context.
 fn get_wake_ctx(
@@ -50,6 +52,39 @@ fn load_tray_icon(path: &str) -> Option<Icon> {
     }
 }
 
+/// Загружает PNG-иконку окна и готовит её для egui.
+///
+/// Исходник — 1024x1024, а `egui::IconData` рассчитан на квадрат вроде
+/// 256x256 (для HiDPI этого достаточно с запасом). Уменьшаем фильтром
+/// Nearest: арт пиксельный, и при сглаживании края «поплывут».
+fn load_window_icon(path: &str) -> Option<egui::IconData> {
+    let decoded = match image::open(Path::new(path)) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("Не удалось загрузить иконку окна из '{path}': {error}");
+            return None;
+        }
+    };
+
+    const MAX_SIDE: u32 = 256;
+    let mut rgba = decoded.into_rgba8();
+    if rgba.width() > MAX_SIDE || rgba.height() > MAX_SIDE {
+        rgba = image::imageops::resize(
+            &rgba,
+            MAX_SIDE,
+            MAX_SIDE,
+            image::imageops::FilterType::Nearest,
+        );
+    }
+
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 /// Создаёт меню и сам TrayIcon. Вызывается в подходящем для платформы потоке.
 fn build_tray(icon: Icon) -> Result<(tray_icon::TrayIcon, MenuId, MenuId), String> {
     let show_item = MenuItem::new("Показать", true, None);
@@ -67,7 +102,7 @@ fn build_tray(icon: Icon) -> Result<(tray_icon::TrayIcon, MenuId, MenuId), Strin
     let builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(icon)
-        .with_tooltip("Rust Music Player");
+        .with_tooltip("Endless Dream");
 
     // В Windows левый клик восстанавливает окно, контекстное меню — по правому клику.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -202,7 +237,7 @@ fn main() -> eframe::Result<()> {
                     None
                 }
             });
-            
+
         if let Some(should_quit) = action {
             // Раньше здесь был std::process::exit(0) для «Выход» — это
             // обрывало процесс мгновенно, МИНУЯ Drop для MusicPlayerApp,
@@ -243,16 +278,24 @@ fn main() -> eframe::Result<()> {
         }
     }));
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1100.0, 700.0])
+        .with_min_inner_size([600.0, 400.0])
+        .with_title("Endless Dream");
+
+    // Иконка окна/панели задач. Если файл недоступен — просто стартуем с
+    // системной иконкой, это не ошибка.
+    if let Some(icon) = load_window_icon(APP_ICON_PATH) {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 700.0])
-            .with_min_inner_size([600.0, 400.0])
-            .with_title("Rust Music Player"),
+        viewport,
         ..Default::default()
     };
 
     eframe::run_native(
-        "Rust Music Player",
+        "Endless Dream",
         options,
         Box::new(move |cc| {
             // Компактная тёмная тема.
@@ -262,9 +305,19 @@ fn main() -> eframe::Result<()> {
             style.spacing.window_margin = egui::Margin::same(6);
             style.spacing.button_padding = egui::vec2(6.0, 3.0);
 
-            style.visuals = egui::Visuals::dark();
+                        style.visuals = egui::Visuals::dark();
 
-            style.visuals.window_fill = egui::Color32::from_rgb(30, 30, 30);
+            // Tooltip (подсказки при наведении) — тёмная тема в стиле приложения.
+            // window_fill — фон всплывающего окна, window_stroke — его рамка,
+            // widgets.noninteractive.fg_stroke.color — текст внутри.
+            // Tooltip: фон + рамка + цвет текста.
+            // Frame::popup берёт extreme_bg_color для фона и window_stroke
+            // для рамки, а НЕ window_fill (это для обычных окон).
+            style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 10, 15); // SIDEBAR_BG
+            style.visuals.window_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(35, 43, 65)); // BORDER
+            style.visuals.widgets.noninteractive.fg_stroke.color =
+                egui::Color32::from_rgb(225, 235, 250); // PRIMARY_TEXT
             style.visuals.panel_fill = egui::Color32::from_rgb(37, 37, 38);
 
             style.visuals.widgets.inactive.bg_fill =
@@ -278,6 +331,7 @@ fn main() -> eframe::Result<()> {
 
             // Убираем I-beam курсор при наведении на лейблы.
             style.interaction.selectable_labels = false;
+            
             cc.egui_ctx.set_global_style(style);
 
             // Загружаем кастомный шрифт ДО первого кадра, иначе первый
@@ -315,7 +369,7 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.request_repaint();
 
             #[cfg(target_os = "linux")]
-            let (tray, show_item_id, quit_item_id) = tray_setup;
+            let (tray, _, _) = tray_setup;
 
             #[cfg(not(target_os = "linux"))]
             let (tray, show_item_id, quit_item_id) = create_tray();
@@ -334,8 +388,6 @@ fn main() -> eframe::Result<()> {
            Ok(Box::new(MusicPlayerApp::new(
                  tray,
                 Arc::clone(&tray_requests),
-                show_item_id,
-                quit_item_id,
                 Arc::clone(&wake_ctx),
             )))
         }),
