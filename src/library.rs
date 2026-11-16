@@ -5,8 +5,6 @@ use std::time::Duration;
 
 use walkdir::WalkDir;
 
-/// Жёсткий потолок на число файловых записей, которые мы вообще просматриваем,
-/// чтобы случайный выбор "C:\" или "/" не повесил приложение на часы.
 const MAX_ENTRIES_SCANNED: usize = 200_000;
 
 /// Потолок на размер библиотеки (треков).
@@ -34,13 +32,7 @@ fn is_supported_audio(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-// Список синхронизирован с фичами rodio/symphonia в Cargo.toml.
-// Opus (.opus/.oga) и AIFF (.aiff/.aif) НЕ декодируются текущим
-// набором фич symphonia-all (нет кодека Opus в symphonia, AIFF — в
-// отдельном фиче-флаге, которого нет в этой версии rodio) — такие
-// файлы попадали бы в библиотеку с читаемыми тегами/обложкой, но не
-// воспроизводились бы. Исключаем их из сканирования, пока кодек не
-// подключён явно.
+
 matches!(
     extension.as_str(),
     "mp3" | "flac" | "wav" | "ogg" | "aac" | "m4a"
@@ -149,11 +141,6 @@ pub fn read_track(path: &Path) -> Result<Track, String> {
     let duration = tagged_file.properties().duration();
     let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
 
-/// Чистит значение тега: убирает NUL-байты и управляющие символы
-/// (встречаются в битых ID3v1-хвостах и multi-value ID3v2.3 Latin1
-/// строках с разделителем `\0`), берёт часть ДО первого `\0`
-/// (так теряется не вся строка, а только "хвост"-мусор), и обрезает
-/// обычные пробелы по краям.
 fn sanitize_tag_value(value: &str) -> Option<String> {
     let before_nul = value.split('\0').next().unwrap_or("");
     let cleaned: String = before_nul
@@ -184,10 +171,7 @@ if let Some(tag) = tag {
     }
 }
 
-    // Обложку здесь намеренно не читаем: при тысячах файлов это съело бы
-    // сотни МБ ОЗУ на одни только JPEG/PNG байты. Для неё есть отдельная
-    // `read_cover()`, которая вызывается точечно — для текущего трека и
-    // видимых строк таблицы.
+
     Ok(Track {
         path: path.to_path_buf(),
         title,
@@ -197,14 +181,6 @@ if let Some(tag) = tag {
     })
 }
 
-/// Достаёт байты первой найденной обложки из тегов файла по пути `path`.
-///
-/// Вызывать ТОЛЬКО точечно (текущий трек в `play_track` или видимые
-/// строки таблицы), а не во время сканирования библиотеки: при тысячах
-/// файлов это съело бы сотни МБ ОЗУ на одни только JPEG/PNG байты.
-///
-/// Возвращает `None`, если файл не читается, в нём нет тегов или в тегах
-/// нет ни одной картинки.
 pub fn read_cover(path: &Path) -> Option<Vec<u8>> {
     let tagged_file = read_from_path(path).ok()?;
     let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;

@@ -50,9 +50,6 @@ impl PlayMode {
         }
     }
 
-    /// Больше не используется для отрисовки (иконку теперь рисует
-    /// repeat_button через Painter), но оставлен как смысловое описание
-    /// режима — например, для логов/отладки.
     #[allow(dead_code)]
     fn icon(self) -> &'static str {
         match self {
@@ -261,9 +258,7 @@ impl MusicPlayerApp {
         self.seek_dragging = false;
         self.last_track_switch = Instant::now();
 
-        // Обложка — только для текущего трека (см. library::read_cover).
-        // Если обложки нет или она не декодируется, нижняя панель покажет
-        // аккуратную пиктограмму на тёмно-синем фоне.
+
         self.current_cover_texture = library::read_cover(&path)
             .and_then(|bytes| decode_pixel_cover(ctx, &bytes));
 
@@ -284,11 +279,6 @@ impl MusicPlayerApp {
         self.cover_textures.remove(&removed_path);
 
         if removed_current {
-            // БАГФИКС: раньше здесь отправлялся Pause, но Pause не
-            // освобождает Sink — после удаления играющего трека и
-            // повторного нажатия Play аудиопоток продолжал воспроизводить
-            // уже удалённый файл. Stop пересоздаёт sink с нуля и сбрасывает
-            // состояние, так что удалённый трек гарантированно не звучит.
             self.audio.send(AudioCommand::Stop);
             self.current_cover_texture = None;
         }
@@ -372,10 +362,7 @@ impl MusicPlayerApp {
     /// БАГФИКС (автопереключение): проверяем "трек закончился" по
     /// позиции/длительности из состояния аудио-потока.
     fn check_track_finished(&mut self, ctx: &egui::Context, audio_state: &AudioState) {
-        // Не проверяем сразу после смены трека: аудио-поток опрашивается
-        // раз в ~100мс и какое-то время ещё может отдавать состояние
-        // старого трека — без этой защиты можно словить "проскакивание"
-        // сразу нескольких треков подряд.
+
         if self.last_track_switch.elapsed() < Duration::from_millis(250) {
             return;
         }
@@ -669,19 +656,13 @@ if audio_state.error.is_some() && self.current_track.is_some() {
                             .size(16.0 * scale),
                     );
                 }
-
-                // Шестерёнка настроек прижата к низу сайдбара: оборачиваем
-                // оставшееся свободное место в bottom_up-layout и кладём туда
-                // только один элемент — он ляжет внизу панели.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     if sidebar_gear_button(ui, scale) {
                         self.show_settings = true;
                     }
                 });
             });
-// Реальный прямоугольник сайдбара — тот, что ВЫЧИСЛИЛ сам egui
-        // внутри Panel::show_inside (уже после round_ui()/учёта DPI).
-        // Никакой арифметики руками: это и есть физический край панели.
+
         self.sidebar_rect = panel_response.response.rect;
     }
     /// Тёмный фрейм для модальных окон (настройки, предупреждения) — вместо
@@ -695,9 +676,7 @@ if audio_state.error.is_some() && self.current_track.is_some() {
         /// Окно настроек и предупреждение об ОЗУ при включении трея.
     /// Обычные (немодальные) egui::Window, открываются по клику на шестерёнку.
     fn render_settings_window(&mut self, ctx: &egui::Context) {
-        // Делаем заголовки окон светлыми (PRIMARY_TEXT).
-        // Это меняет цвет для всего noninteractive-текста на кадр,
-        // но в нашем приложении он и так светлый — вреда нет.
+
         ctx.global_style_mut(|style| {
             style.visuals.widgets.noninteractive.fg_stroke.color = PRIMARY_TEXT;
         });
@@ -812,13 +791,6 @@ if audio_state.error.is_some() && self.current_track.is_some() {
         }
     }
 
-    /// Виртуализированная таблица треков с жёстким ограничением ширины.
-    ///
-    /// Ширина текстовых столбцов рассчитывается до создания TableBuilder:
-    /// при обычной ширине исполнитель и альбом получают по 150 pt, а
-    /// название забирает остаток через Column::remainder(). На очень узких
-    /// окнах все колонки пропорционально сжимаются, поэтому сумма их ширин
-    /// вместе с межколоночными промежутками не превышает видимую область.
     fn render_track_table(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let mut clicked_index: Option<usize> = None;
@@ -883,9 +855,6 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                     ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
                     ui.visuals_mut().widgets.active.bg_stroke = egui::Stroke::NONE;
 
-                    // TableBuilder 0.27 резервирует место под вертикальный
-                    // scrollbar при расчёте ширины таблицы, поэтому учитываем
-                    // тот же резерв заранее.
                     let scrollbar_reserve = ui.spacing().scroll.bar_inner_margin
                         + ui.spacing().scroll.bar_width
                         + ui.spacing().scroll.bar_outer_margin;
@@ -905,10 +874,6 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                     let gaps_width = table_spacing * 5.0;
                     let columns_budget = (available_table_width - gaps_width).max(0.0);
 
-                    // Базовая минимальная композиция:
-                    // 42 + 60 + 30 + 80 + 80 + 80 = 372 pt.
-                    // Последние 80 pt оставляем под основную колонку «Название».
-                    // Ниже этой ширины вся сетка уменьшается пропорционально.
                     let compact_scale = (columns_budget / 372.0).clamp(0.0, 1.0);
                     let cover_column_width = 42.0 * compact_scale;
                     let duration_column_width = 60.0 * compact_scale;
@@ -930,31 +895,17 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                     let album_column_width =
                         (150.0 * compact_scale).min(width_for_each_metadata_column);
 
-                    // В egui_extras 0.27 размеры TableBuilder сохраняются по ID.
-                    // Включаем ширину в ID, чтобы при resize окна таблица брала
-                    // новые рассчитанные размеры, а не прежние сохранённые.
-                    // Округление вниз оставляет небольшой запас и исключает
-                    // переполнение из-за дробной погрешности.
                     let table_width_key = available_table_width as i64;
                     ui.push_id(("track_table_fit_v3", table_width_key), |ui| {
-                        // Клонируем painter ДО того, как ui уйдёт во владение
-                        // TableBuilder — он нужен позже, внутри header, чтобы
-                        // нарисовать линию на всю ширину таблицы (у TableRow
-                        // нет собственного ui.painter()/ui.max_rect()).
                         let header_line_painter = ui.painter().clone();
 
                         TableBuilder::new(ui)
                             .striped(false)
-                            // Горизонтальная прокрутка выключена самим TableBuilder;
-                            // auto_shrink по X не позволяет таблице расширить область.
                             .auto_shrink([true, false])
                             .sense(egui::Sense::click())
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            // Все шесть колонок фиксированы и не реагируют на перетаскивание границ.
                             .column(Column::initial(cover_column_width).resizable(false))
-                            // Название получает остаток между служебными колонками.
                             .column(Column::remainder().resizable(false))
-                            // Метаданные имеют рассчитанные ширины и адаптивный минимум.
                             .column(
                                 Column::initial(artist_column_width)
                                     .at_least(artist_min_width)
@@ -996,14 +947,6 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                                 });
                                 header.col(|_ui| {});
 
-                                // Линия под заголовками на всю ширину таблицы.
-                                // У TableRow нет собственного ui.painter()/
-                                // ui.max_rect() (это не Ui, а обёртка над
-                                // ячейками), поэтому берём готовый rect всей
-                                // строки через response() (валиден только
-                                // после того, как добавлена хотя бы одна
-                                // колонка) и рисуем заранее клонированным
-                                // painter'ом внешнего ui.
                                 let header_rect = header.response().rect;
                                 header_line_painter.hline(
                                     header_rect.x_range(),
@@ -1148,8 +1091,6 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                                         );
                                     });
 
-                                    // Клик/двойной клик и курсор читаем из общего response
-                                    // строки (TableBuilder.sense(Sense::click()) включён выше).
                                     let response = row.response();
                                     if response.hovered() {
                                         response
@@ -1181,13 +1122,8 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                 });
             });
 
-        // Реальный прямоугольник центральной области (из response.rect).
-        // Нужен, чтобы при необходимости закрыть щель закраской по
-        // фактическим координатам, а не по предположению.
         self.central_rect = panel_response.response.rect;
 
-        // Ограничиваем кэш обложек до 100 элементов.
-        // Если превышает — удаляем самый старый (LRU).
 const MAX_COVERS: usize = 20;
 while self.cover_textures.len() > MAX_COVERS {
     let oldest_key = self
@@ -1245,8 +1181,6 @@ while self.cover_textures.len() > MAX_COVERS {
 
                 let layout_scale = scale.min((available_width / 564.0).max(0.15));
 
-                // Зоны: левая (инфо) — 50%, центральная (кнопки) — 180px, правая (громкость) — остаток.
-                // Кнопки физически прижаты к правому краю центральной зоны, то есть ближе к громкости.
                 let zone_gaps = ui.spacing().item_spacing.x * 2.0;
                 let usable_width = (available_width - zone_gaps).max(1.0);
                 let center_width = 170.0 * layout_scale;
@@ -1489,8 +1423,6 @@ if volume_response.dragged() || volume_response.clicked() {
                 });
             });
 
-        // Реальный прямоугольник нижней панели (из response.rect) —
-        // используется ниже для точной горизонтальной линии.
         self.control_panel_rect = panel_response.response.rect;
     }
 }
@@ -1512,18 +1444,13 @@ impl eframe::App for MusicPlayerApp {
             style.visuals.widgets.inactive.fg_stroke.color =
                 egui::Color32::from_rgb(225, 235, 250);
         });
-    // Фон на случай первого кадра/ресайза, пока sidebar_rect/central_rect
-        // ещё не обновились. Сами панели красят себя сами и полностью
-        // покрывают max_rect() (eframe::App::ui отдаёт Ui БЕЗ margin и фона
-        // в 0.34 — см. докстроку eframe::App::ui), так что это просто
-        // подложка «на всякий случай», а не способ скрыть щель вычислением.
+
         ui.painter().rect_filled(
             ui.max_rect(),
             egui::CornerRadius::ZERO,
             egui::Color32::from_rgb(10, 10, 15),
         );
 
-        // Один раз сохраняем базовый стиль из main.rs (после set_style).
         if !self.base_style_captured {
             self.base_style = (*ctx.global_style()).clone();
             self.base_style_captured = true;
@@ -1559,10 +1486,6 @@ impl eframe::App for MusicPlayerApp {
         }
 
         if want_quit {
-            // Явно просим штатное закрытие вместо std::process::exit(0) в
-            // main.rs — так Drop успевает отработать. `quitting = true`
-            // нужен, чтобы следующий close_requested (который породит сам
-            // этот Close) не свернулся в трей веткой выше.
             self.quitting = true;
             self.save_state_now();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1583,8 +1506,6 @@ impl eframe::App for MusicPlayerApp {
         self.update_scan();
         self.update_restore();
 
-        // Периодическое сохранение (раз в ~30 сек), только если что-то
-        // реально изменилось с прошлого сохранения.
         if self.last_periodic_save.elapsed() >= Duration::from_secs(30) {
             self.save_state_if_changed();
             self.last_periodic_save = Instant::now();
@@ -1629,7 +1550,6 @@ impl eframe::App for MusicPlayerApp {
         };
                 ctx.request_repaint_after(Duration::from_millis(repaint_ms));
 
-        // === Рисуем линии поверх всего (реальными координатами egui) ===
         use egui::emath::GuiRounding as _;
 
         let ppp = ctx.pixels_per_point();
@@ -1643,19 +1563,9 @@ impl eframe::App for MusicPlayerApp {
         ));
 
         if self.sidebar_rect != egui::Rect::NOTHING {
-            // 1. Вертикальная линия строго по правому краю сайдбара.
-            //    self.sidebar_rect — реальный rect, который вернул
-            //    Panel::show_inside, а не наше предположение.
-            //    round_to_pixel_center ставит линию в середину физического
-            //    пикселя, поэтому при stroke-ширине в 1 физ. пиксель она не
-            //    размывается на два ряда пикселей.
+
             let split_x = self.sidebar_rect.right().round_to_pixel_center(ppp);
             painter.vline(split_x, self.sidebar_rect.y_range(), line_stroke);
-
-            // Если между реальным правым краем сайдбара и реальным левым
-            // краем центральной области всё же остаётся зазор (например,
-            // на один кадр после ресайза/смены scale) — закрашиваем именно
-            // этот измеренный зазор цветом сайдбара, а не гадаем число.
             if self.central_rect != egui::Rect::NOTHING {
                 let gap_left = self.sidebar_rect.right();
                 let gap_right = self.central_rect.left();
@@ -1670,8 +1580,6 @@ impl eframe::App for MusicPlayerApp {
         }
 
         if self.control_panel_rect != egui::Rect::NOTHING {
-            // 2. Горизонтальная линия строго по верхнему краю нижней панели,
-            //    от правого края сайдбара и до реального правого края панели.
             let split_y = self.control_panel_rect.top().round_to_pixel_center(ppp);
             let left_x = self.sidebar_rect.right().min(self.control_panel_rect.left());
             painter.hline(left_x..=self.control_panel_rect.right(), split_y, line_stroke);
@@ -1679,31 +1587,12 @@ impl eframe::App for MusicPlayerApp {
     }
 }
 impl Drop for MusicPlayerApp {
-    /// Срабатывает и при обычном закрытии окна (tray_enabled == false), и
-    /// при выходе через «Выход» в трее — см. правку `want_quit` в `fn ui`
-    /// и замену `std::process::exit(0)` в `main.rs` (иначе процесс
-    /// завершался бы мгновенно, и Drop вообще не вызывался бы).
     fn drop(&mut self) {
         self.save_state_now();
     }
 }
 // ================= Пиксельная обложка =================
 
-/// Декодирует сырые байты обложки (PNG/JPEG/...) и превращает их в чёткую
-/// "пиксельную" GPU-текстуру:
-/// 1. Уменьшаем до 64x64 фильтром Nearest — пикселизация остаётся аккуратной.
-/// 2. Увеличиваем до 128x128, снова Nearest — получаем ровные
-///    квадратные блоки без какого-либо сглаживания/блюра.
-/// 3. Грузим как TextureOptions::NEAREST, чтобы и при финальном
-///    масштабировании на экране (128 → 64 в нижней панели) пиксели
-///    оставались чёткими, а не размазывались билинейной фильтрацией.
-///
-/// Вызывается при смене текущего трека и лениво для видимых строк таблицы.
-/// Жёсткий потолок на сырые байты встроенной обложки ДО декодирования.
-/// Легитимные обложки для плеера с окном 64x64/128x128 крайне редко
-/// весят больше нескольких МБ; файлы тяжелее — почти всегда не обложка,
-/// а, например, ошибочно вложенный буклет/скан — такие декодировать
-/// в память целиком не нужно.
 const MAX_COVER_BYTES: usize = 8 * 1024 * 1024; // 8 МБ
 
 fn decode_pixel_cover(ctx: &egui::Context, bytes: &[u8]) -> Option<egui::TextureHandle> {
@@ -1715,14 +1604,6 @@ fn decode_pixel_cover(ctx: &egui::Context, bytes: &[u8]) -> Option<egui::Texture
         return None;
     }
 
-    // ВНИМАНИЕ: image::load_from_memory декодирует картинку в ПОЛНОМ
-    // исходном разрешении (3000x3000 JPEG -> ~36 МБ RGBA-буфер), и
-    // только после этого мы уменьшаем её до 64x64. Это источник
-    // кратковременных пиков ОЗУ. `image` 0.24 не умеет "scaled decode"
-    // (частичное/уменьшенное декодирование на лету для JPEG) без
-    // дополнительных крейтов (например, turbojpeg с DCT-скейлингом) —
-    // проверь по docs.rs/image/0.24, появилась ли такая возможность,
-    // прежде чем усложнять это место.
     let decoded = image::load_from_memory(bytes).ok()?;
     let rgba = decoded.to_rgba8();
     let tiny = image::imageops::resize(&rgba, 64, 64, image::imageops::FilterType::Nearest);
@@ -1750,15 +1631,7 @@ fn pixel_hash(mut value: u32) -> u32 {
 fn hash_unit(value: u32) -> f32 {
     (pixel_hash(value) & 0x00FF_FFFF) as f32 / 16_777_215.0
 }
-
-/// Рисует медленно движущиеся пиксельные облака, редкие пиксельные звёзды и падающую комету.
-/// Звёзды остаются на постоянных координатах, мерцает только их альфа.
-/// Облака двигаются независимо друг от друга по константным пиксельным маскам.
-/// Рисует медленно движущиеся пиксельные облака, редкие пиксельные звёзды и падающую комету.
-/// Звёзды остаются на постоянных координатах, мерцает только их альфа.
-/// Облака двигаются независимо друг от друга по константным пиксельным маскам.
-/// Рисует пиксельные звёзды, комету и красивые пухлые облака.
-/// Рисует пиксельные звёзды, комету и красивые пухлые облака.
+/// Рисует пиксельные звёзды, облака и комету.
 fn paint_pixel_stars(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     const STAR_COUNT: u32 = 76;
 
@@ -2045,13 +1918,6 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     )
 }
 
-/// Тонкий слайдер-дорожка (перемотка/громкость) — целиком на Painter, без
-/// стандартной "ручки" egui: линия 3px, заливка ACCENT-цветом до текущего
-/// значения, вертикальная пиксельная черта 2x10 появляется при наведении/драге.
-/// Без скруглений (Rounding::ZERO) — строго пиксельная геометрия.
-///
-/// В egui 0.27 у Slider нет .desired_width() — здесь это не нужно: размер
-/// задаётся напрямую через allocate_exact_size.
 fn thin_slider(
     ui: &mut egui::Ui,
     value: &mut f32,
@@ -2114,8 +1980,6 @@ fn thin_slider(
     response
 }
 
-/// Квадратная кнопка Play/Pause (48x48): идеальный пиксельный треугольник
-/// или симметричная пауза. При нажатии кнопка сжимается внутрь на 1.5 px.
 fn play_pause_button(ui: &mut egui::Ui, playing: bool, size: f32) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
@@ -2197,9 +2061,6 @@ fn play_pause_button(ui: &mut egui::Ui, playing: bool, size: f32) -> bool {
     response.on_hover_text(label).clicked()
 }
 
-/// Квадратная кнопка Prev/Next (32x32): симметричные треугольник и
-/// вертикальная планка, сгруппированные и отцентрированные как одна иконка.
-/// Синий фон и белая иконка соответствуют общей стилистике кнопки Play.
 fn skip_button(ui: &mut egui::Ui, forward: bool, size: f32) -> bool {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
 
@@ -2274,8 +2135,6 @@ fn skip_button(ui: &mut egui::Ui, forward: bool, size: f32) -> bool {
     response.on_hover_text(label).clicked()
 }
 
-/// Квадратная кнопка Repeat: две встречные пиксельные стрелки образуют
-/// квадратный цикл. В режиме RepeatOne в центре появляется растровая цифра 1.
 fn repeat_button(ui: &mut egui::Ui, mode: PlayMode, size: f32) -> bool {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
 
@@ -2377,8 +2236,6 @@ enum SidebarIcon {
     Plus,
 }
 
-/// Рисует компактную пиксельную иконку музыкальной ноты без текстового глифа.
-/// Это исключает fallback на системный emoji/symbol font.
 fn draw_music_note_icon(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -2417,8 +2274,6 @@ fn draw_music_note_icon(
     painter.rect_filled(head, egui::CornerRadius::ZERO, color);
 }
 
-/// Рисует пиксельную корзину удаления через геометрические примитивы.
-/// Текстовый emoji намеренно не используется, чтобы не подключался системный шрифт.
 fn draw_trash_icon(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -2458,8 +2313,6 @@ fn draw_trash_icon(
     }
 }
 
-/// Кнопка сайдбара: прозрачная (frame(false)-стиль, но на чистом Painter),
-/// с иконкой слева и подсветкой фона при наведении. Без скруглений.
 fn sidebar_button(ui: &mut egui::Ui, icon: SidebarIcon, label: &str, width: f32, scale: f32) -> bool {
     let height = 32.0 * scale;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -2505,8 +2358,6 @@ fn sidebar_button(ui: &mut egui::Ui, icon: SidebarIcon, label: &str, width: f32,
     response.clicked()
 }
 
-/// Рисует иконку сайдбара (папка / плюс-файл) простыми фигурами через
-/// Painter. Без скруглений (Rounding::ZERO).
 fn draw_sidebar_icon(
     painter: &egui::Painter,
     icon: SidebarIcon,
@@ -2593,7 +2444,6 @@ fn draw_gear_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color:
             paint_rect(sx * 3.6, sy * 3.6, 2.2, 2.2, color);
         }
     }
-
     // Кольцо (больше, с выраженным «провалом» — фон виден между зубцами и кольцом)
     paint_rect(0.0, 0.0, 6.6, 6.6, color);
     paint_rect(0.0, 0.0, 3.0, 3.0, bg);

@@ -52,11 +52,6 @@ fn load_tray_icon(path: &str) -> Option<Icon> {
     }
 }
 
-/// Загружает PNG-иконку окна и готовит её для egui.
-///
-/// Исходник — 1024x1024, а `egui::IconData` рассчитан на квадрат вроде
-/// 256x256 (для HiDPI этого достаточно с запасом). Уменьшаем фильтром
-/// Nearest: арт пиксельный, и при сглаживании края «поплывут».
 fn load_window_icon(path: &str) -> Option<egui::IconData> {
     let decoded = match image::open(Path::new(path)) {
         Ok(image) => image,
@@ -115,8 +110,6 @@ fn build_tray(icon: Icon) -> Result<(tray_icon::TrayIcon, MenuId, MenuId), Strin
     Ok((tray, show_item_id, quit_item_id))
 }
 
-// На Linux tray-icon 0.19 использует GTK/AppIndicator. eframe работает через
-// winit, поэтому GTK должен обслуживаться собственным потоком и main loop.
 #[cfg(target_os = "linux")]
 fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
     let (sender, receiver) =
@@ -239,11 +232,6 @@ fn main() -> eframe::Result<()> {
             });
 
         if let Some(should_quit) = action {
-            // Раньше здесь был std::process::exit(0) для «Выход» — это
-            // обрывало процесс мгновенно, МИНУЯ Drop для MusicPlayerApp,
-            // так что сохранить состояние было уже невозможно. Теперь
-            // просто взводим флаг и будим UI-поток: реальное закрытие
-            // (и сохранение) происходит в fn ui через ViewportCommand::Close.
             if let Ok(mut req) = menu_requests.lock() {
                 if should_quit {
                     req.1 = true;
