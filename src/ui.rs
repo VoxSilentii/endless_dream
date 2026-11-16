@@ -2,7 +2,7 @@
 use crate::audio::{AudioCommand, AudioController, AudioState};
 use crate::library::{self as library, format_duration, scan_directory, Track};
 use crate::TrayHandle;
-
+use crate::state::{self, SavedState};
 use eframe::egui;
 use tray_icon::menu::MenuId;
 use egui_extras::{Column, TableBuilder};
@@ -78,12 +78,7 @@ impl PlayMode {
         }
     }
 }
-/// Режим сканирования папки: заменить плейлист или добавить в конец.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScanMode {
-    Replace,
-    Append,
-}
+
 /// Главное приложение.
 pub struct MusicPlayerApp {
     audio: AudioController,
@@ -106,8 +101,7 @@ pub struct MusicPlayerApp {
     // Канал получения результата фонового сканирования.
     scan_receiver: Option<Receiver<Result<Vec<Track>, String>>>,
     is_scanning: bool,
-    /// Режим текущего сканирования: заменить плейлист или добавить в конец.
-    scan_mode: ScanMode,
+
     // Состояние перемотки.
     seek_value: f32,
     seek_dragging: bool,
@@ -154,22 +148,59 @@ pub struct MusicPlayerApp {
     base_style: egui::Style,
     /// Захвачен ли базовый стиль из main.rs (один раз).
     base_style_captured: bool,
-    /// Сбросить скролл таблицы на следующем кадре (после replace self.tracks).
-    reset_track_table_scroll: bool,
-
+    
+ /// Точный прямоугольник сайдбара для отрисовки линий.
+    /// Берётся из response.rect, который вернул сам Panel::show_inside —
+    /// то есть это реальные координаты egui, а не вычисленные вручную.
+    sidebar_rect: egui::Rect,
+    /// Точный прямоугольник нижней панели управления (для разделительной линии).
+    control_panel_rect: egui::Rect,
+    /// Точный прямоугольник центральной области (для диагностики/закрытия щели).
+    central_rect: egui::Rect,
+        /// Канал фонового восстановления треков из прошлой сессии — не блокирует
+    /// первый кадр. См. `MusicPlayerApp::new()` и `update_restore()`.
+    restore_receiver: Option<Receiver<Vec<Track>>>,
+    /// Когда в последний раз пробовали сделать периодическое сохранение.
+    last_periodic_save: Instant,
+    /// Хэш последнего УЖЕ сохранённого состояния — чтобы периодическое
+    /// сохранение не писало на диск, если ничего не изменилось.
+    last_saved_signature: u64,
+    /// Взведён, когда пользователь выбрал «Выход» в трее: следующий
+    /// close_requested не должен сворачиваться в трей, а должен реально
+    /// закрыть окно (иначе выйти через меню трея при включённом
+    /// tray_enabled было бы невозможно).
+    quitting: bool,
 }
 
 
+
 impl MusicPlayerApp {
-           pub fn new(
+              pub fn new(
         tray: Option<TrayHandle>,
         tray_requests: Arc<Mutex<(bool, bool)>>,
         show_item_id: Option<MenuId>,
         quit_item_id: Option<MenuId>,
         wake_ctx: Arc<Mutex<Option<egui::Context>>>,
- 
     ) -> Self {
-        Self {
+        // Быстрая синхронная загрузка (крошечный JSON) — а вот сами треки
+        // восстанавливаем асинхронно ниже: read_track() читает теги КАЖДОГО
+        // файла, и на большой библиотеке это не должно блокировать первый кадр.
+        let saved_state = state::load_state();
+
+        let restore_receiver = saved_state.as_ref().and_then(|saved| {
+            if saved.track_paths.is_empty() {
+                return None;
+            }
+            let (tx, rx) = mpsc::channel();
+            let paths = saved.track_paths.clone();
+            thread::spawn(move || {
+                let tracks = state::restore_tracks(&paths);
+                let _ = tx.send(tracks);
+            });
+            Some(rx)
+        });
+
+        let mut app = Self {
             audio: AudioController::new(),
 
             tracks: Vec::new(),
@@ -178,15 +209,15 @@ impl MusicPlayerApp {
             current_track: None,
 
             status: "Готов".to_string(),
-            volume: 0.7,
+            volume: saved_state.as_ref().map(|s| s.volume).unwrap_or(0.7),
             tray,
             show_item_id,
             quit_item_id,
-            ui_scale: 1.0,
+            ui_scale: saved_state.as_ref().map(|s| s.ui_scale).unwrap_or(1.0),
 
             scan_receiver: None,
             is_scanning: false,
-            scan_mode: ScanMode::Replace,
+
             seek_value: 0.0,
             seek_dragging: false,
             last_seek_time: None,
@@ -194,22 +225,37 @@ impl MusicPlayerApp {
             play_mode: PlayMode::Normal,
             last_track_switch: Instant::now() - Duration::from_secs(1),
 
-            fonts_loaded: false,
-                current_cover_texture: None,
-                       cover_textures: HashMap::new(),
+            fonts_loaded: true,
+            current_cover_texture: None,
+            cover_textures: HashMap::new(),
             wake_ctx,
             tray_requests,
- 
 
-            tray_enabled: false,
+            tray_enabled: saved_state.as_ref().map(|s| s.tray_enabled).unwrap_or(false),
             show_settings: false,
             pending_tray_warning: false,
             pending_zoom: 0.0,
             last_ui_scale: 1.0,
             base_style: egui::Style::default(),
             base_style_captured: false,
-            reset_track_table_scroll: false,
-        }
+            sidebar_rect: egui::Rect::NOTHING,
+            control_panel_rect: egui::Rect::NOTHING,
+            central_rect: egui::Rect::NOTHING,
+
+            restore_receiver,
+            last_periodic_save: Instant::now(),
+            last_saved_signature: 0,
+            quitting: false,
+        };
+        
+        // Синхронизируем аудиопоток с сохранённой громкостью, иначе
+        // аудио-поток стартует с дефолтным 0.7, а ползунок показывает
+        // сохранённое значение — и громкость меняется только после
+        // первого движения ползунка.
+        let initial_volume = saved_state.as_ref().map(|s| s.volume).unwrap_or(0.7);
+        app.audio.send(AudioCommand::SetVolume(initial_volume));
+        
+        app
     }
 
     // ---------- Шрифты ----------
@@ -412,38 +458,31 @@ impl MusicPlayerApp {
     }
 
     // ---------- Выбор файлов/папок ----------
-    /// Выбор файлов и/или папок через системный диалог.
-    /// Файлы добавляются в конец плейлиста.
-    /// Папки сканируются рекурсивно (в фоне) и их треки добавляются в конец.
-    fn choose_files_or_folders(&mut self) {
-        let paths = rfd::FileDialog::new()
-            .set_title("Выберите файлы или папки")
+
+    /// Выбор папки через системный диалог.
+    fn choose_directory(&mut self) {
+        if self.is_scanning {
+            return;
+        }
+
+        let directory = rfd::FileDialog::new()
+            .set_title("Выберите папку с музыкой")
+            .pick_folder();
+
+        if let Some(directory) = directory {
+            self.start_scan(directory);
+        }
+    }
+
+    /// Выбор отдельных аудиофайлов через системный диалог (с фильтром).
+    fn choose_files(&mut self) {
+        let files = rfd::FileDialog::new()
+            .set_title("Выберите аудиофайлы")
             .add_filter("Аудио", SUPPORTED_AUDIO_EXT)
             .pick_files();
 
-        let Some(paths) = paths else {
-            return;
-        };
-
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut folders: Vec<PathBuf> = Vec::new();
-
-        for path in paths {
-            if path.is_dir() {
-                folders.push(path);
-            } else {
-                files.push(path);
-            }
-        }
-
-        // Файлы — синхронно (быстро, несколько файлов).
-        if !files.is_empty() {
-            self.add_files(files);
-        }
-
-        // Папки — в фоне, добавляя в конец плейлиста (не заменяя).
-        for folder in folders {
-            self.start_scan_append(folder);
+        if let Some(paths) = files {
+            self.add_files(paths);
         }
     }
 
@@ -502,7 +541,6 @@ impl MusicPlayerApp {
 
         self.scan_receiver = Some(rx);
         self.is_scanning = true;
-        self.scan_mode = ScanMode::Replace;
 
         self.status = "Сканирование библиотеки...".to_string();
 
@@ -511,22 +549,8 @@ impl MusicPlayerApp {
             let _ = tx.send(result);
         });
     }
-    /// Сканирует папку в фоне и **добавляет** найденные треки в конец
-    /// плейлиста (не заменяет). Используется кнопкой «Добавить».
-    fn start_scan_append(&mut self, directory: PathBuf) {
-        let (tx, rx) = mpsc::channel();
 
-        self.scan_receiver = Some(rx);
-        self.is_scanning = true;
-        self.scan_mode = ScanMode::Append;
-        self.status = "Сканирование папки...".to_string();
-
-        thread::spawn(move || {
-            let result = scan_directory(&directory);
-            let _ = tx.send(result);
-        });
-    }
-       /// Проверка результата сканирования.
+    /// Проверка результата сканирования.
     fn update_scan(&mut self) {
         let result = self
             .scan_receiver
@@ -542,23 +566,13 @@ impl MusicPlayerApp {
                     Ok(tracks) => {
                         let count = tracks.len();
 
-                        match self.scan_mode {
-                            ScanMode::Replace => {
-                                self.tracks = tracks;
-                                self.reset_track_table_scroll = true;
-                                self.cover_textures.clear();
-                                self.current_cover_texture = None;
-                                self.selected_track = None;
-                                self.current_track = None;
-                                self.status = format!("Загружено треков: {}", count);
-                            }
-                            ScanMode::Append => {
-                                self.tracks.extend(tracks);
-                                self.reset_track_table_scroll = false;
-                                self.status = format!("Добавлено треков из папки: {}", count);
-                            }
-                        }
-                        self.scan_mode = ScanMode::Replace; // сброс
+                        self.tracks = tracks;
+                        self.cover_textures.clear();
+                        self.current_cover_texture = None;
+                        self.selected_track = None;
+                        self.current_track = None;
+
+                        self.status = format!("Загружено треков: {}", count);
                     }
                     Err(err) => {
                         self.status = format!("Ошибка сканирования: {}", err);
@@ -574,22 +588,95 @@ impl MusicPlayerApp {
             None => {}
         }
     }
+    /// Проверка результата фонового восстановления треков из прошлой сессии.
+    /// Отдельный канал от сканирования — не мешает обычному выбору папки.
+    fn update_restore(&mut self) {
+        let result = self
+            .restore_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
 
+        match result {
+            Some(Ok(tracks)) => {
+                self.restore_receiver = None;
+                let count = tracks.len();
+                self.tracks = tracks;
+                self.status = format!("Восстановлено треков из прошлой сессии: {}", count);
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {}
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.restore_receiver = None;
+            }
+            None => {}
+        }
+    }
 
+    /// Текущее состояние приложения в виде структуры для сохранения.
+    fn saved_state_snapshot(&self) -> SavedState {
+        SavedState {
+            track_paths: self.tracks.iter().map(|t| t.path.clone()).collect(),
+            tray_enabled: self.tray_enabled,
+            volume: self.volume,
+            ui_scale: self.ui_scale,
+        }
+    }
+
+    /// Хэш снимка состояния — чтобы не писать на диск без необходимости.
+    fn state_signature(snapshot: &SavedState) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        for path in &snapshot.track_paths {
+            path.hash(&mut hasher);
+        }
+        snapshot.tray_enabled.hash(&mut hasher);
+        snapshot.volume.to_bits().hash(&mut hasher);
+        snapshot.ui_scale.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Безусловно сохраняет состояние. Не паникует при ошибке I/O — только
+    /// логирует в stderr. Используется в Drop, при сворачивании в трей и
+    /// при выходе через меню трея.
+    fn save_state_now(&mut self) {
+        let snapshot = self.saved_state_snapshot();
+        let signature = Self::state_signature(&snapshot);
+
+        if let Err(error) = state::save_state(&snapshot) {
+            eprintln!("Не удалось сохранить состояние плеера: {error}");
+            return;
+        }
+
+        self.last_saved_signature = signature;
+    }
+
+    /// Сохраняет, только если состояние изменилось с прошлого раза.
+    /// Вызывается периодически (раз в ~30 сек) из `fn ui`.
+    fn save_state_if_changed(&mut self) {
+        let snapshot = self.saved_state_snapshot();
+        if Self::state_signature(&snapshot) == self.last_saved_signature {
+            return;
+        }
+        self.save_state_now();
+    }
     // ---------- Отрисовка ----------
 
     /// Левый сайдбар: название приложения и кнопки выбора музыкальных файлов.
-     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
+    fn render_sidebar(&mut self, ui: &mut egui::Ui) {
         let scale = self.ui_scale.clamp(0.5, 2.0);
-        egui::Panel::left("sidebar")
+        let panel_response = egui::Panel::left("sidebar")
             .exact_size(220.0 * scale)
             .resizable(false)
+            .show_separator_line(false)
             .frame(
-                egui::Frame::NONE
-                    .fill(SIDEBAR_BG)
-                    .stroke(egui::Stroke::new(1.0_f32 * scale, BORDER))
-                    .inner_margin(egui::Margin::symmetric((14.0 * scale) as i8, (16.0 * scale) as i8)),
-            )
+    egui::Frame::NONE
+        .fill(SIDEBAR_BG)
+        .inner_margin(egui::Margin::symmetric(
+            (14.0 * scale) as i8,
+            (16.0 * scale) as i8,
+        )),
+)
             .show_inside(ui, |ui| {
  
 
@@ -607,8 +694,14 @@ impl MusicPlayerApp {
 
                 ui.add_space(18.0 * scale);
 
-                if sidebar_button(ui, SidebarIcon::Plus, "Добавить", 210.0 * scale, scale) {
-                    self.choose_files_or_folders();
+                if sidebar_button(ui, SidebarIcon::Folder, "Выбрать папку", 210.0 * scale, scale) {
+                    self.choose_directory();
+                }
+
+                ui.add_space(2.0 * scale);
+
+                if sidebar_button(ui, SidebarIcon::Plus, "Добавить файлы", 210.0 * scale, scale) {
+                    self.choose_files();
                 }
 
                 ui.add_space(12.0 * scale);
@@ -640,19 +733,72 @@ impl MusicPlayerApp {
                     }
                 });
             });
+// Реальный прямоугольник сайдбара — тот, что ВЫЧИСЛИЛ сам egui
+        // внутри Panel::show_inside (уже после round_ui()/учёта DPI).
+        // Никакой арифметики руками: это и есть физический край панели.
+        self.sidebar_rect = panel_response.response.rect;
     }
-
-    /// Окно настроек и предупреждение о ЦП при включении трея.
+    /// Тёмный фрейм для модальных окон (настройки, предупреждения) — вместо
+    /// стандартного светло-серого egui::Window.
+    fn settings_window_frame() -> egui::Frame {
+        egui::Frame::NONE
+            .fill(SIDEBAR_BG)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+    }
+        /// Окно настроек и предупреждение об ОЗУ при включении трея.
     /// Обычные (немодальные) egui::Window, открываются по клику на шестерёнку.
     fn render_settings_window(&mut self, ctx: &egui::Context) {
+        // Делаем заголовки окон светлыми (PRIMARY_TEXT).
+        // Это меняет цвет для всего noninteractive-текста на кадр,
+        // но в нашем приложении он и так светлый — вреда нет.
+        ctx.style_mut(|style| {
+            style.visuals.widgets.noninteractive.fg_stroke.color = PRIMARY_TEXT;
+        });
+
+        // Затемнение фона под модальными окнами.
+        if self.show_settings || self.pending_tray_warning {
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("settings_dim_backdrop"),
+            ))
+            .rect_filled(
+                ctx.content_rect(),
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+            );
+        }
+
         if self.show_settings {
             let mut open = true;
             let mut close_clicked = false;
             egui::Window::new("Настройки")
                 .collapsible(false)
                 .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .frame(Self::settings_window_frame())
                 .open(&mut open)
                 .show(ctx, |ui| {
+                    let v = ui.visuals_mut();
+                    v.override_text_color = Some(PRIMARY_TEXT);
+                    
+                    // Цвета текста и иконок для всех состояний
+                    v.widgets.noninteractive.fg_stroke.color = PRIMARY_TEXT;
+                    v.widgets.inactive.fg_stroke.color = PRIMARY_TEXT;
+                    v.widgets.hovered.fg_stroke.color = PRIMARY_TEXT;
+                    v.widgets.active.fg_stroke.color = PRIMARY_TEXT;
+
+                    // Фон кнопок (чтобы текст не сливался с фоном приложения)
+                    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+                    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 60);
+                    v.widgets.active.bg_fill = egui::Color32::from_rgb(70, 70, 70);
+                    
+                    // Фон для чекбоксов (галочки)
+                    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(45, 45, 45);
+                    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(60, 60, 60);
+                    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(70, 70, 70);
+
                     let mut enabled = self.tray_enabled;
                     if ui
                         .checkbox(&mut enabled, "Сворачивать в трей")
@@ -681,10 +827,30 @@ impl MusicPlayerApp {
             egui::Window::new("Внимание")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .frame(Self::settings_window_frame())
+                                .show(ctx, |ui| {
+                    let v = ui.visuals_mut();
+                    v.override_text_color = Some(PRIMARY_TEXT);
+                    
+                    v.widgets.noninteractive.fg_stroke.color = PRIMARY_TEXT;
+                    v.widgets.inactive.fg_stroke.color = PRIMARY_TEXT;
+                    v.widgets.hovered.fg_stroke.color = PRIMARY_TEXT;
+                    v.widgets.active.fg_stroke.color = PRIMARY_TEXT;
+
+                    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+                    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 60);
+                    v.widgets.active.bg_fill = egui::Color32::from_rgb(70, 70, 70);
+                    
+                    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(45, 45, 45);
+                    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(60, 60, 60);
+                    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(70, 70, 70);
+
                     ui.label(
-                        "При работе в трее ЦП в фоне увеличится до 5–8%. \
-                         Музыка продолжит играть, пока окно свёрнуто. Продолжить?",
+                        "При сворачивании в трей плеер не закрывается, а остаётся \
+                         работать в фоне. Потребление ОЗУ может вырасти. \
+                         Продолжить?",
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -709,12 +875,6 @@ impl MusicPlayerApp {
     /// вместе с межколоночными промежутками не превышает видимую область.
     fn render_track_table(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-
-        // Одноразовый сброс скролла: если self.tracks только что заменили
-        // (update_scan), позиция скролла могла остаться за пределами новой
-        // коллекции — body.rows не вызовет замыкание. Сбрасываем на этом кадре.
-        let reset_table_scroll = std::mem::take(&mut self.reset_track_table_scroll);
-
         let mut clicked_index: Option<usize> = None;
         let mut double_clicked_index: Option<usize> = None;
         let mut delete_index: Option<usize> = None;
@@ -727,19 +887,14 @@ impl MusicPlayerApp {
         let tracks = &self.tracks;
         let cover_textures = &mut self.cover_textures;
 
-        egui::CentralPanel::default()
+        let panel_response = egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(16, 14, 25))
                     .stroke(egui::Stroke::NONE)
-                    .inner_margin(egui::Margin {
-    left: (12.0 * scale) as i8,
-    right: (12.0 * scale) as i8,
-    top: (12.0 * scale) as i8,
-    bottom: 0,
-}),
+                             .inner_margin(egui::Margin::ZERO),
             )
-            .show_inside(ui, |ui| {
+                  .show_inside(ui, |ui| {
 
                 // Пиксельные звёзды рисуются под таблицей: координаты стабильны,
                 // меняется только их яркость, а комета движется по времени.
@@ -840,12 +995,8 @@ impl MusicPlayerApp {
                         // нет собственного ui.painter()/ui.max_rect()).
                         let header_line_painter = ui.painter().clone();
 
-                        let mut table = TableBuilder::new(ui)
-                            .striped(false);
-                        if reset_table_scroll {
-                            table = table.vertical_scroll_offset(0.0);
-                        }
-                        table
+                        TableBuilder::new(ui)
+                            .striped(false)
                             // Горизонтальная прокрутка выключена самим TableBuilder;
                             // auto_shrink по X не позволяет таблице расширить область.
                             .auto_shrink([true, false])
@@ -1077,6 +1228,12 @@ impl MusicPlayerApp {
                     });
                 });
             });
+
+        // Реальный прямоугольник центральной области (из response.rect).
+        // Нужен, чтобы при необходимости закрыть щель закраской по
+        // фактическим координатам, а не по предположению.
+        self.central_rect = panel_response.response.rect;
+
         // Ограничиваем кэш обложек до 100 элементов.
         // Если превышает — удаляем самый старый (LRU).
         const MAX_COVERS: usize = 20;
@@ -1114,19 +1271,20 @@ impl MusicPlayerApp {
         let audio_state = self.audio.get_state();
         let scale = self.ui_scale.clamp(0.5, 2.0);
 
-        egui::Panel::bottom("control_panel")
+        let panel_response = egui::Panel::bottom("control_panel")
             .exact_size(120.0 * scale)
+            .resizable(false)
+            .show_separator_line(false)
             .frame(
-                egui::Frame::NONE
-                    .fill(CONTROL_BG)
-                    .stroke(egui::Stroke::new(1.0_f32 * scale, BORDER))
-                   .inner_margin(egui::Margin {
-        left: (6.0 * scale) as i8,
-        right: (6.0 * scale) as i8,
-        top: (8.0 * scale) as i8,
+    egui::Frame::NONE
+        .fill(CONTROL_BG)
+        .inner_margin(egui::Margin {
+            left: (6.0 * scale) as i8,
+            right: (6.0 * scale) as i8,
+            top: (8.0 * scale) as i8,
             bottom: 0,
-}),
-            )
+        }),
+)
             .show_inside(ui, |ui| {
 
                 let available_width = ui.available_width().max(1.0);
@@ -1370,13 +1528,17 @@ ui.allocate_ui_with_layout(
             egui::vec2(slider_width, 15.0 * layout_scale),
             layout_scale,
         );
-        if volume_response.dragged() || volume_response.clicked() {
+if volume_response.dragged() || volume_response.clicked() {
             self.audio.send(AudioCommand::SetVolume(self.volume));
         }
     },
 );
                 });
             });
+
+        // Реальный прямоугольник нижней панели (из response.rect) —
+        // используется ниже для точной горизонтальной линии.
+        self.control_panel_rect = panel_response.response.rect;
     }
 }
 
@@ -1384,9 +1546,20 @@ impl eframe::App for MusicPlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+    // Фон на случай первого кадра/ресайза, пока sidebar_rect/central_rect
+        // ещё не обновились. Сами панели красят себя сами и полностью
+        // покрывают max_rect() (eframe::App::ui отдаёт Ui БЕЗ margin и фона
+        // в 0.34 — см. докстроку eframe::App::ui), так что это просто
+        // подложка «на всякий случай», а не способ скрыть щель вычислением.
+        ui.painter().rect_filled(
+            ui.max_rect(),
+            egui::CornerRadius::ZERO,
+            egui::Color32::from_rgb(10, 10, 15),
+        );
+
         // Один раз сохраняем базовый стиль из main.rs (после set_style).
         if !self.base_style_captured {
-            self.base_style = (*ctx.style()).clone();
+            self.base_style = (*ctx.global_style()).clone();
             self.base_style_captured = true;
         }
 
@@ -1394,7 +1567,7 @@ impl eframe::App for MusicPlayerApp {
             *wake_ctx = Some(ctx.clone());
         }
 
-        let (want_show, _want_quit) = self
+        let (want_show, want_quit) = self
             .tray_requests
             .lock()
             .map(|mut r| {
@@ -1406,9 +1579,12 @@ impl eframe::App for MusicPlayerApp {
 
         // Крестик.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && self.tray.is_some() && self.tray_enabled {
+        if close_requested && self.tray.is_some() && self.tray_enabled && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Сворачивание в трей не завершает процесс — Drop ещё не
+            // вызовется, поэтому сохраняем явно, здесь единственный шанс.
+            self.save_state_now();
         }
 
         if want_show {
@@ -1416,9 +1592,17 @@ impl eframe::App for MusicPlayerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
+        if want_quit {
+            // Явно просим штатное закрытие вместо std::process::exit(0) в
+            // main.rs — так Drop успевает отработать. `quitting = true`
+            // нужен, чтобы следующий close_requested (который породит сам
+            // этот Close) не свернулся в трей веткой выше.
+            self.quitting = true;
+            self.save_state_now();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         self.render_settings_window(&ctx);
-        self.ensure_fonts_loaded(&ctx);
- 
 
                 let zoom_delta = ctx.input(|i| i.zoom_delta());
         if zoom_delta != 1.0 {
@@ -1431,17 +1615,24 @@ impl eframe::App for MusicPlayerApp {
             }
         }
         self.update_scan();
+        self.update_restore();
 
+        // Периодическое сохранение (раз в ~30 сек), только если что-то
+        // реально изменилось с прошлого сохранения.
+        if self.last_periodic_save.elapsed() >= Duration::from_secs(30) {
+            self.save_state_if_changed();
+            self.last_periodic_save = Instant::now();
+        }
 
         let audio_state = self.audio.get_state();
         if let Some(error) = &audio_state.error {
             self.status = error.clone();
         }
         self.check_track_finished(&ctx, &audio_state);
-// Правка А: пересчитываем стиль только при изменении ui_scale,
+    // Правка А: пересчитываем стиль только при изменении ui_scale,
         // а не каждый кадр. base_style — кастомный стиль из main.rs.
 
-if (self.ui_scale - self.last_ui_scale).abs() > 0.0001 {
+    if (self.ui_scale - self.last_ui_scale).abs() > 0.0001 {
     let mut style = self.base_style.clone();
     for font in style.text_styles.values_mut() {
         font.size *= self.ui_scale;
@@ -1450,9 +1641,9 @@ if (self.ui_scale - self.last_ui_scale).abs() > 0.0001 {
     style.spacing.button_padding *= self.ui_scale;
     style.spacing.interact_size *= self.ui_scale;
     style.spacing.slider_width *= self.ui_scale;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
     self.last_ui_scale = self.ui_scale;
-}
+    }
         self.render_sidebar(ui);
         self.render_control_panel(ui);
         self.render_track_table(ui);
@@ -1463,17 +1654,73 @@ if (self.ui_scale - self.last_ui_scale).abs() > 0.0001 {
         });
         let window_shown = visible && !minimized;
         let audio_active = audio_state.is_playing || audio_state.is_paused;
-        let repaint_ms = if !window_shown {
+                let repaint_ms = if !window_shown {
             1000
         } else if audio_active {
             16
         } else {
             33
         };
-        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+                ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+
+        // === Рисуем линии поверх всего (реальными координатами egui) ===
+        use egui::emath::GuiRounding as _;
+
+        let ppp = ctx.pixels_per_point();
+        // Ширина в 1 физический пиксель на любом DPI (1.0, 1.25, 1.5, 2.0...).
+        let hairline = 1.0 / ppp;
+        let line_stroke = egui::Stroke::new(hairline, BORDER);
+
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("paint_lines"),
+        ));
+
+        if self.sidebar_rect != egui::Rect::NOTHING {
+            // 1. Вертикальная линия строго по правому краю сайдбара.
+            //    self.sidebar_rect — реальный rect, который вернул
+            //    Panel::show_inside, а не наше предположение.
+            //    round_to_pixel_center ставит линию в середину физического
+            //    пикселя, поэтому при stroke-ширине в 1 физ. пиксель она не
+            //    размывается на два ряда пикселей.
+            let split_x = self.sidebar_rect.right().round_to_pixel_center(ppp);
+            painter.vline(split_x, self.sidebar_rect.y_range(), line_stroke);
+
+            // Если между реальным правым краем сайдбара и реальным левым
+            // краем центральной области всё же остаётся зазор (например,
+            // на один кадр после ресайза/смены scale) — закрашиваем именно
+            // этот измеренный зазор цветом сайдбара, а не гадаем число.
+            if self.central_rect != egui::Rect::NOTHING {
+                let gap_left = self.sidebar_rect.right();
+                let gap_right = self.central_rect.left();
+                if gap_right - gap_left > 0.5 {
+                    let gap = egui::Rect::from_min_max(
+                        egui::pos2(gap_left, self.sidebar_rect.top()),
+                        egui::pos2(gap_right, self.sidebar_rect.bottom()),
+                    );
+                    painter.rect_filled(gap, egui::CornerRadius::ZERO, SIDEBAR_BG);
+                }
+            }
+        }
+
+        if self.control_panel_rect != egui::Rect::NOTHING {
+            // 2. Горизонтальная линия строго по верхнему краю нижней панели,
+            //    от правого края сайдбара и до реального правого края панели.
+            let split_y = self.control_panel_rect.top().round_to_pixel_center(ppp);
+            let left_x = self.sidebar_rect.right().min(self.control_panel_rect.left());
+            painter.hline(left_x..=self.control_panel_rect.right(), split_y, line_stroke);
+        }
     }
 }
-
+impl Drop for MusicPlayerApp {
+    /// Срабатывает и при обычном закрытии окна (tray_enabled == false), и
+    /// при выходе через «Выход» в трее — см. правку `want_quit` в `fn ui`
+    /// и замену `std::process::exit(0)` в `main.rs` (иначе процесс
+    /// завершался бы мгновенно, и Drop вообще не вызывался бы).
+    fn drop(&mut self) {
+        self.save_state_now();
+    }
+}
 // ================= Пиксельная обложка =================
 
 /// Декодирует сырые байты обложки (PNG/JPEG/...) и превращает их в чёткую
@@ -2330,27 +2577,33 @@ fn sidebar_gear_button(ui: &mut egui::Ui, scale: f32) -> bool {
 
     response.on_hover_text("Настройки").clicked()
 }
-
-/// Рисует пиксельную шестерёнку: кольцо с зубцами + ступица. Зубцы —
-/// обычные (неповёрнутые) квадраты, что на таком размере по-прежнему
-/// читается как шестерёнка и остаётся в духе Rounding::ZERO.
 fn draw_gear_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
-    let outer_radius = size * 0.5;
-    let inner_radius = size * 0.2;
-    let ring_width = (size * 0.14).max(1.5);
-    let tooth_count = 8;
-    let tooth_len = size * 0.18;
-    let tooth_width = (size * 0.14).max(1.5);
+    let cell = size / 14.0;
+    let bg = SIDEBAR_BG;
+    let paint_rect = |x: f32, y: f32, w: f32, h: f32, fill: egui::Color32| {
+        let rect = egui::Rect::from_center_size(
+            center + egui::vec2(x * cell, y * cell),
+            egui::vec2(w * cell, h * cell),
+        );
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    };
 
-    for i in 0..tooth_count {
-        let angle = i as f32 * std::f32::consts::TAU / tooth_count as f32;
-        let dir = egui::vec2(angle.cos(), angle.sin());
-        let tooth_center = center + dir * (outer_radius + tooth_len * 0.35);
-        let tooth_rect =
-            egui::Rect::from_center_size(tooth_center, egui::vec2(tooth_width, tooth_len));
-        painter.rect_filled(tooth_rect, egui::CornerRadius::ZERO, color);
+    // 4 прямых зубца (более длинные)
+    paint_rect(0.0, -5.0, 2.0, 3.0, color);
+    paint_rect(0.0,  5.0, 2.0, 3.0, color);
+    paint_rect(-5.0, 0.0, 3.0, 2.0, color);
+    paint_rect( 5.0, 0.0, 3.0, 2.0, color);
+
+    // 4 угловых зубца (смещены наружу)
+    for sx in [-1.0_f32, 1.0] {
+        for sy in [-1.0_f32, 1.0] {
+            paint_rect(sx * 3.6, sy * 3.6, 2.2, 2.2, color);
+        }
     }
 
-    painter.circle_stroke(center, outer_radius, egui::Stroke::new(ring_width, color));
-    painter.circle_filled(center, inner_radius, color);
+    // Кольцо (больше, с выраженным «провалом» — фон виден между зубцами и кольцом)
+    paint_rect(0.0, 0.0, 6.6, 6.6, color);
+    paint_rect(0.0, 0.0, 3.0, 3.0, bg);
+    paint_rect(0.0, 0.0, 1.4, 1.4, color);
+    paint_rect(0.0, 0.0, 0.5, 0.5, bg);
 }

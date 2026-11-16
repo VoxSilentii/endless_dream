@@ -1,6 +1,7 @@
 mod audio;
 mod library;
 mod ui;
+mod state;
 
 #[cfg(target_os = "linux")]
 pub(crate) type TrayHandle = std::thread::JoinHandle<()>;
@@ -201,17 +202,22 @@ fn main() -> eframe::Result<()> {
                     None
                 }
             });
-
+            
         if let Some(should_quit) = action {
-            if should_quit {
-                std::process::exit(0);
-            } else {
-                if let Ok(mut req) = menu_requests.lock() {
+            // Раньше здесь был std::process::exit(0) для «Выход» — это
+            // обрывало процесс мгновенно, МИНУЯ Drop для MusicPlayerApp,
+            // так что сохранить состояние было уже невозможно. Теперь
+            // просто взводим флаг и будим UI-поток: реальное закрытие
+            // (и сохранение) происходит в fn ui через ViewportCommand::Close.
+            if let Ok(mut req) = menu_requests.lock() {
+                if should_quit {
+                    req.1 = true;
+                } else {
                     req.0 = true;
                 }
-                if let Some(ctx) = get_wake_ctx(&menu_wake_ctx) {
-                    ctx.request_repaint();
-                }
+            }
+            if let Some(ctx) = get_wake_ctx(&menu_wake_ctx) {
+                ctx.request_repaint();
             }
         }
     }));
@@ -221,6 +227,7 @@ fn main() -> eframe::Result<()> {
     let tray_wake_requests = Arc::clone(&tray_requests);
 
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
@@ -272,6 +279,40 @@ fn main() -> eframe::Result<()> {
             // Убираем I-beam курсор при наведении на лейблы.
             style.interaction.selectable_labels = false;
             cc.egui_ctx.set_global_style(style);
+
+            // Загружаем кастомный шрифт ДО первого кадра, иначе первый
+            // кадр окна отрисуется дефолтным системным шрифтом.
+            {
+                use eframe::egui;
+                const PIXEL_FONT_BYTES: &[u8] =
+                    include_bytes!("../assets/DepartureMono.otf");
+                const PIXEL_FONT_NAME: &str = "Pixelify Sans";
+
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    PIXEL_FONT_NAME.to_owned(),
+                    egui::FontData::from_static(PIXEL_FONT_BYTES).into(),
+                );
+
+                let proportional = fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default();
+                proportional.clear();
+                proportional.push(PIXEL_FONT_NAME.to_owned());
+
+                let monospace = fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default();
+                monospace.clear();
+                monospace.push(PIXEL_FONT_NAME.to_owned());
+
+                cc.egui_ctx.set_fonts(fonts);
+            }
+            // Просим перерисовать окно сразу — на случай, если первый
+            // кадр уже был отрисован до set_fonts.
+            cc.egui_ctx.request_repaint();
 
             #[cfg(target_os = "linux")]
             let (tray, show_item_id, quit_item_id) = tray_setup;
