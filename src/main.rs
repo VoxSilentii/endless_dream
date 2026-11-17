@@ -188,7 +188,77 @@ fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
     }
 }
 
+#[cfg(target_os = "windows")]
+struct SingleInstanceGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Пытается захватить именованный мьютекс.
+/// `None` — приложение уже запущено; `Some(guard)` — этот экземпляр первый
+/// (или мьютекс недоступен, тогда не мешаем запуску).
+#[cfg(target_os = "windows")]
+fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\EndlessDream.SingleInstance\0"
+        .encode_utf16()
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+
+    if handle.is_null() {
+        // Не смогли создать мьютекс — не блокируем запуск.
+        return Some(SingleInstanceGuard(handle));
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        return None;
+    }
+
+    Some(SingleInstanceGuard(handle))
+}
+
+/// Поднимает окно уже запущенного экземпляра.
+#[cfg(target_os = "windows")]
+fn focus_existing_instance() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    let title: Vec<u16> = "Endless Dream\0".encode_utf16().collect();
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if !hwnd.is_null() {
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    // Single-instance lock: второй запуск не создаёт ещё одно окно/трей,
+    // а просто разворачивает уже работающий экземпляр.
+    #[cfg(target_os = "windows")]
+    let _single_instance = match acquire_single_instance() {
+        Some(guard) => guard,
+        None => {
+            focus_existing_instance();
+            return Ok(());
+        }
+    };
+
     let wake_ctx: Arc<Mutex<Option<egui::Context>>> =
         Arc::new(Mutex::new(None));
     // (show, quit) — запросы из трея, применяются на UI-потоке в update().

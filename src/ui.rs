@@ -250,6 +250,7 @@ impl MusicPlayerApp {
         }
 
         let path = self.tracks[index].path.clone();
+        let fallback_duration = self.tracks[index].duration;
 
         self.current_track = Some(index);
         self.selected_track = Some(index);
@@ -262,7 +263,10 @@ impl MusicPlayerApp {
         self.current_cover_texture = library::read_cover(&path)
             .and_then(|bytes| decode_pixel_cover(ctx, &bytes));
 
-        self.audio.send(AudioCommand::Play(path));
+        self.audio.send(AudioCommand::Play {
+            path,
+            fallback_duration,
+        });
 
         self.status = format!("Воспроизведение: {}", self.tracks[index].title);
     }

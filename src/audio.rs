@@ -11,7 +11,12 @@ use std::time::Duration;
 /// Команды аудиопотоку.
 #[derive(Debug)]
 pub enum AudioCommand {
-    Play(PathBuf),
+    Play {
+        path: PathBuf,
+        /// Длительность из тегов — используется, если декодер не смог
+        /// определить её сам (для многих MP3 `total_duration()` равен None).
+        fallback_duration: Duration,
+    },
     Pause,
     Resume,
     Stop,
@@ -95,7 +100,10 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
     loop {
         match command_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(command) => match command {
-                AudioCommand::Play(path) => {
+                AudioCommand::Play {
+                    path,
+                    fallback_duration,
+                } => {
                     if let Some(old_sink) = sink.take() {
                         old_sink.stop();
                     }
@@ -107,8 +115,10 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                             let reader = BufReader::new(file);
                             match Decoder::new(reader) {
                                 Ok(source) => {
-                                    let duration =
-                                        source.total_duration().unwrap_or(Duration::ZERO);
+                                    let duration = source
+                                        .total_duration()
+                                        .filter(|duration| !duration.is_zero())
+                                        .unwrap_or(fallback_duration);
 
                                     match Sink::try_new(&stream_handle) {
                                         Ok(new_sink) => {
