@@ -33,6 +33,10 @@ pub struct AudioState {
     pub duration: Duration,
     pub volume: f32,
     pub error: Option<String>,
+    /// Текущий sink полностью опустел — трек действительно доиграл.
+    /// В отличие от `position >= duration`, работает и при нулевой/неверной
+    /// длительности.
+    pub finished: bool,
 }
 
 impl Default for AudioState {
@@ -44,6 +48,7 @@ impl Default for AudioState {
             duration: Duration::ZERO,
             volume: 0.7,
             error: None,
+            finished: false,
         }
     }
 }
@@ -104,6 +109,13 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                     path,
                     fallback_duration,
                 } => {
+                    // Сбрасываем «доиграл» сразу при получении команды, ещё до
+                    // открытия файла: иначе UI успеет увидеть старое значение
+                    // и перескочить через трек, пока декодер только открывается.
+                    if let Ok(mut state) = shared_state.lock() {
+                        state.finished = false;
+                    }
+
                     if let Some(old_sink) = sink.take() {
                         old_sink.stop();
                     }
@@ -115,10 +127,30 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                             let reader = BufReader::new(file);
                             match Decoder::new(reader) {
                                 Ok(source) => {
-                                    let duration = source
+                                    // Приоритет у метаданных: rodio для VBR MP3
+                                    // иногда отдаёт ненулевую, но неверную оценку.
+                                    let decoder_duration = source
                                         .total_duration()
-                                        .filter(|duration| !duration.is_zero())
-                                        .unwrap_or(fallback_duration);
+                                        .filter(|duration| !duration.is_zero());
+                                    let duration = if fallback_duration.is_zero() {
+                                        decoder_duration.unwrap_or(Duration::ZERO)
+                                    } else {
+                                        fallback_duration
+                                    };
+
+                                    if let Some(decoder_duration) = decoder_duration {
+                                        if !fallback_duration.is_zero()
+                                            && decoder_duration.abs_diff(fallback_duration)
+                                                > Duration::from_secs(1)
+                                        {
+                                            eprintln!(
+                                                "Длительность '{}' расходится: метаданные {:?}, декодер {:?}",
+                                                path.display(),
+                                                fallback_duration,
+                                                decoder_duration
+                                            );
+                                        }
+                                    }
 
                                     match Sink::try_new(&stream_handle) {
                                         Ok(new_sink) => {
@@ -135,6 +167,7 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                                                 state.duration = duration;
                                                 state.volume = volume;
                                                 state.error = None;
+                                                state.finished = false;
                                             }
                                         }
                                         Err(err) => {
@@ -201,6 +234,7 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                         state.is_paused = false;
                         state.position = Duration::ZERO;
                         state.duration = Duration::ZERO;
+                        state.finished = false;
                     }
                 }
 
@@ -235,6 +269,7 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                 state.position = position;
                 state.duration = current_duration;
                 state.is_playing = !current_sink.is_paused() && !empty;
+                state.finished = empty;
 
                 if empty {
                     state.is_playing = false;
@@ -253,5 +288,8 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
 fn set_error(shared_state: &Arc<Mutex<AudioState>>, message: String) {
     if let Ok(mut state) = shared_state.lock() {
         state.error = Some(message);
+        // Ошибка обрабатывается отдельной веткой UI; не даём старому
+        // «finished» инициировать ещё одно переключение.
+        state.finished = false;
     }
 }

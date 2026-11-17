@@ -107,6 +107,12 @@ fn fix_tag_encoding(value: &str) -> String {
         return value.to_string();
     }
 
+    // `as u8` имеет смысл только для символов Latin-1. Если в строке есть
+    // что-то за пределами U+00FF, лучше ничего не чинить, чем испортить.
+    if value.chars().any(|c| c as u32 > 0xFF) {
+        return value.to_string();
+    }
+
     let bytes: Vec<u8> = value.chars().map(|c| c as u32 as u8).collect();
     
     // Попытка 1: CP1251
@@ -129,18 +135,6 @@ fn fix_tag_encoding(value: &str) -> String {
     value.to_string()
 
 }
-pub fn read_track(path: &Path) -> Result<Track, String> {
-    let file_name = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Unknown")
-        .to_string();
-
-    let tagged_file = read_from_path(path).map_err(|err| format!("Ошибка чтения тегов: {err}"))?;
-
-    let duration = tagged_file.properties().duration();
-    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
-
 fn sanitize_tag_value(value: &str) -> Option<String> {
     let before_nul = value.split('\0').next().unwrap_or("");
     let cleaned: String = before_nul
@@ -154,6 +148,18 @@ fn sanitize_tag_value(value: &str) -> Option<String> {
         Some(trimmed.to_string())
     }
 }
+
+pub fn read_track(path: &Path) -> Result<Track, String> {
+    let file_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let tagged_file = read_from_path(path).map_err(|err| format!("Ошибка чтения тегов: {err}"))?;
+
+    let duration = tagged_file.properties().duration();
+    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
 
 let mut title = file_name;
 let mut artist = "Unknown Artist".to_string();

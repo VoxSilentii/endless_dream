@@ -50,15 +50,6 @@ impl PlayMode {
         }
     }
 
-    #[allow(dead_code)]
-    fn icon(self) -> &'static str {
-        match self {
-            PlayMode::Normal => "repeat-off",
-            PlayMode::RepeatAll => "repeat-all",
-            PlayMode::RepeatOne => "repeat-one",
-        }
-    }
-
     fn tooltip(self) -> &'static str {
         match self {
             PlayMode::Normal => "Без повтора — нажмите, чтобы включить повтор плейлиста",
@@ -102,6 +93,10 @@ pub struct MusicPlayerApp {
     /// не срабатывало повторно, пока аудио-поток ещё не успел обновить
     /// состояние (он опрашивается раз в ~100мс).
     last_track_switch: Instant,
+
+    /// Сколько треков подряд завершились ошибкой. Нужно, чтобы плейлист из
+    /// битых файлов не крутился бесконечно в RepeatAll.
+    error_streak: u32,
 
     /// Пиксельная обложка текущего трека (64x64 → 128x128, Nearest).
     current_cover_texture: Option<egui::TextureHandle>,
@@ -205,6 +200,7 @@ impl MusicPlayerApp {
 
             play_mode: PlayMode::Normal,
             last_track_switch: Instant::now() - Duration::from_secs(1),
+            error_streak: 0,
 
             current_cover_texture: None,
             cover_textures: HashMap::new(),
@@ -363,10 +359,11 @@ impl MusicPlayerApp {
         }
     }
 
-    /// БАГФИКС (автопереключение): проверяем "трек закончился" по
-    /// позиции/длительности из состояния аудио-потока.
+    /// Проверяем, что текущий трек доиграл, и при необходимости переключаем.
+    ///
+    /// Основной сигнал — `audio_state.finished`: sink действительно опустел.
+    /// Это работает и для треков, у которых длительность неизвестна или 0.
     fn check_track_finished(&mut self, ctx: &egui::Context, audio_state: &AudioState) {
-
         if self.last_track_switch.elapsed() < Duration::from_millis(250) {
             return;
         }
@@ -374,24 +371,53 @@ impl MusicPlayerApp {
             return;
         }
 
-        let duration_secs = audio_state.duration.as_secs_f32();
+        // Ошибки декодирования обрабатываем отдельно: иначе битый плейлист
+        // в RepeatAll будет бесконечно перезапускаться на каждом кадре.
+        if audio_state.error.is_some() {
+            const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+
+            if self.error_streak < MAX_CONSECUTIVE_ERRORS {
+                self.error_streak += 1;
+                self.advance_after_finish(ctx);
+            } else if self.error_streak == MAX_CONSECUTIVE_ERRORS {
+                self.error_streak += 1;
+                self.status = "Слишком много ошибок подряд — воспроизведение остановлено"
+                    .to_string();
+                self.last_track_switch = Instant::now();
+            }
+            return;
+        }
+        self.error_streak = 0;
+
+        if audio_state.finished {
+            self.advance_after_finish(ctx);
+            return;
+        }
+
+        // Резервная проверка по позиции: на случай, если сигнал `finished`
+        // не дошёл, но позиция уже упёрлась в длительность.
+        let fallback_duration = self
+            .current_track
+            .and_then(|index| self.tracks.get(index))
+            .map(|track| track.duration)
+            .unwrap_or(Duration::ZERO);
+        let duration = if audio_state.duration > Duration::ZERO {
+            audio_state.duration
+        } else {
+            fallback_duration
+        };
+        let duration_secs = duration.as_secs_f32();
         if duration_secs <= 0.0 {
             return;
         }
 
-        let finished = (!audio_state.is_playing
+        let finished = !audio_state.is_playing
             && !audio_state.is_paused
-            && audio_state.position.as_secs_f32() >= duration_secs - 0.5)
-            || (audio_state.position.as_secs_f32() >= duration_secs - 0.1);
+            && audio_state.position.as_secs_f32() >= duration_secs - 0.5;
 
         if finished {
             self.advance_after_finish(ctx);
         }
-        // Если текущий трек не играет из-за ошибки — переключаем на следующий.
-if audio_state.error.is_some() && self.current_track.is_some() {
-    self.advance_after_finish(ctx);
-    return;
-}
     }
 
     // ---------- Выбор файлов/папок ----------
@@ -671,20 +697,18 @@ if audio_state.error.is_some() && self.current_track.is_some() {
     }
     /// Тёмный фрейм для модальных окон (настройки, предупреждения) — вместо
     /// стандартного светло-серого egui::Window.
-    fn settings_window_frame() -> egui::Frame {
+    fn settings_window_frame(scale: f32) -> egui::Frame {
         egui::Frame::NONE
             .fill(SIDEBAR_BG)
             .stroke(egui::Stroke::new(1.0_f32, BORDER))
-            .inner_margin(egui::Margin::symmetric(16, 12))
+            .inner_margin(egui::Margin::symmetric(
+                (16.0 * scale) as i8,
+                (12.0 * scale) as i8,
+            ))
     }
         /// Окно настроек и предупреждение об ОЗУ при включении трея.
     /// Обычные (немодальные) egui::Window, открываются по клику на шестерёнку.
     fn render_settings_window(&mut self, ctx: &egui::Context) {
-
-        ctx.global_style_mut(|style| {
-            style.visuals.widgets.noninteractive.fg_stroke.color = PRIMARY_TEXT;
-        });
-
         // Затемнение фона под модальными окнами.
         if self.show_settings || self.pending_tray_warning {
             ctx.layer_painter(egui::LayerId::new(
@@ -706,7 +730,7 @@ if audio_state.error.is_some() && self.current_track.is_some() {
                 .resizable(false)
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .frame(Self::settings_window_frame())
+                .frame(Self::settings_window_frame(self.ui_scale))
                 .open(&mut open)
                 .show(ctx, |ui| {
                     let v = ui.visuals_mut();
@@ -758,7 +782,7 @@ if audio_state.error.is_some() && self.current_track.is_some() {
                 .resizable(false)
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .frame(Self::settings_window_frame())
+                .frame(Self::settings_window_frame(self.ui_scale))
                                 .show(ctx, |ui| {
                     let v = ui.visuals_mut();
                     v.override_text_color = Some(PRIMARY_TEXT);
@@ -1128,7 +1152,7 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
 
         self.central_rect = panel_response.response.rect;
 
-const MAX_COVERS: usize = 20;
+const MAX_COVERS: usize = 200;
 while self.cover_textures.len() > MAX_COVERS {
     let oldest_key = self
         .cover_textures
@@ -1279,7 +1303,21 @@ while self.cover_textures.len() > MAX_COVERS {
                                             ),
                                         );
 
-                                        let duration_secs = audio_state.duration.as_secs_f32();
+                                        // Пока аудиопоток не обработал Play, duration
+                                        // ещё может быть нулевой. Берём метаданные
+                                        // текущего трека как запасное значение, чтобы
+                                        // ползунок не мигал и не исчезал.
+                                        let fallback_duration = self
+                                            .current_track
+                                            .and_then(|index| self.tracks.get(index))
+                                            .map(|track| track.duration)
+                                            .unwrap_or(Duration::ZERO);
+                                        let duration = if audio_state.duration > Duration::ZERO {
+                                            audio_state.duration
+                                        } else {
+                                            fallback_duration
+                                        };
+                                        let duration_secs = duration.as_secs_f32();
                                         if duration_secs > 0.0 {
                                             let duration_width = (38.0 * layout_scale)
                                                 .min((time_ui.available_width() * 0.28).max(1.0));
@@ -1322,7 +1360,7 @@ while self.cover_textures.len() > MAX_COVERS {
                                             time_ui.add_sized(
                                                 egui::vec2(duration_width, 15.0 * layout_scale),
                                                 egui::Label::new(
-                                                    egui::RichText::new(format_duration(audio_state.duration))
+                                                    egui::RichText::new(format_duration(duration))
                                                         .size(10.0 * layout_scale)
                                                         .color(MUTED_TEXT),
                                                 ),
@@ -1592,7 +1630,9 @@ impl eframe::App for MusicPlayerApp {
 }
 impl Drop for MusicPlayerApp {
     fn drop(&mut self) {
-        self.save_state_now();
+        // Пишем только если состояние действительно изменилось с прошлого
+        // сохранения (периодического, при сворачивании в трей или выходе).
+        self.save_state_if_changed();
     }
 }
 // ================= Пиксельная обложка =================

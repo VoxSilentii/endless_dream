@@ -157,13 +157,19 @@ fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
         }
     };
 
-    match receiver.recv() {
+    match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(Ok((show_item_id, quit_item_id))) => {
             (Some(tray_thread), Some(show_item_id), Some(quit_item_id))
         }
         Ok(Err(_)) => (None, None, None),
-        Err(error) => {
-            eprintln!("GTK-поток трея завершился до инициализации: {error}");
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // GTK мог зависнуть на gtk::init() (нет $DISPLAY, проблемы Wayland).
+            // Не блокируем запуск плеера навсегда — стартуем без трея.
+            eprintln!("GTK-поток трея не ответил за 5 секунд — запускаемся без трея");
+            (None, None, None)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("GTK-поток трея завершился до инициализации");
             (None, None, None)
         }
     }
@@ -230,19 +236,113 @@ fn acquire_single_instance() -> Option<SingleInstanceGuard> {
     Some(SingleInstanceGuard(handle))
 }
 
+/// Проверяет, что окно принадлежит именно этому исполняемому файлу.
+#[cfg(target_os = "windows")]
+unsafe fn window_belongs_to_current_exe(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+) -> bool {
+    use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return false;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return false;
+    }
+
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe {
+        CloseHandle(process);
+    }
+
+    if ok == 0 {
+        return false;
+    }
+
+    let path = PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize]));
+    let Ok(current) = std::env::current_exe() else {
+        return true;
+    };
+    let normalize = |p: &std::path::Path| {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    };
+    normalize(&path) == normalize(&current)
+}
+
 /// Поднимает окно уже запущенного экземпляра.
 #[cfg(target_os = "windows")]
 fn focus_existing_instance() {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+        BringWindowToTop, FindWindowExW, GetForegroundWindow, GetWindowThreadProcessId,
+        SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
     };
 
     let title: Vec<u16> = "Endless Dream\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-    if !hwnd.is_null() {
-        unsafe {
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
+
+    // Ищем окно с нашим заголовком, но проверяем, что оно принадлежит именно
+    // этому exe: иначе можно развернуть чужое приложение с тем же именем.
+    let mut after: HWND = std::ptr::null_mut();
+    let mut found: HWND = std::ptr::null_mut();
+    loop {
+        after = unsafe {
+            FindWindowExW(
+                std::ptr::null_mut(),
+                after,
+                std::ptr::null(),
+                title.as_ptr(),
+            )
+        };
+        if after.is_null() {
+            break;
+        }
+        if unsafe { window_belongs_to_current_exe(after) } {
+            found = after;
+            break;
+        }
+    }
+
+    if found.is_null() {
+        return;
+    }
+
+    unsafe {
+        // Окно могло быть скрыто в трей — сначала показываем, потом разворачиваем.
+        ShowWindow(found, SW_SHOW);
+        ShowWindow(found, SW_RESTORE);
+
+        // SetForegroundWindow может не сработать из-за foreground-lock.
+        // Присоединяемся к потоку текущего foreground-окна, чтобы обойти его.
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let current_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+
+        BringWindowToTop(found);
+        SetForegroundWindow(found);
+
+        if attached {
+            AttachThreadInput(current_thread, foreground_thread, 0);
         }
     }
 }
