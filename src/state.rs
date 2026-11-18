@@ -95,10 +95,14 @@ fn legacy_state_file_path() -> Option<PathBuf> {
 ///
 /// Если состояния по новому пути нет, пробуем старый каталог — так
 /// плейлист переживает переименование приложения.
+///
+/// Если же новый файл существует, но повреждён, legacy-путь не читаем:
+/// иначе после сбоя записи плеер молча откатился бы на старый плейлист
+/// и пользователь потерял бы свежие изменения.
 pub fn load_state() -> Option<SavedState> {
     if let Some(path) = state_file_path() {
-        if let Some(state) = load_state_from(&path) {
-            return Some(state);
+        if path.exists() {
+            return load_state_from(&path);
         }
     }
 

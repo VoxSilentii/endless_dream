@@ -11,7 +11,38 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Момент старта процесса — для временных меток в debug.log.
+static DEBUG_LOG_START: OnceLock<Instant> = OnceLock::new();
+
+/// ДИАГНОСТИКА (временно): дописывает строку в %APPDATA%\EndlessDream\debug.log.
+/// Нужна для разбора бага с системным крестиком при включённом трее.
+fn debug_log(msg: &str) {
+    use std::io::Write as _;
+
+    let Some(base_dirs) = directories::BaseDirs::new() else {
+        return;
+    };
+    let dir = base_dirs.config_dir().join("EndlessDream");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("debug.log"))
+    else {
+        return;
+    };
+
+    let elapsed_ms = DEBUG_LOG_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis();
+    let _ = writeln!(file, "[{elapsed_ms} ms] {msg}");
+}
  
 // ---------- Космическая палитра ----------
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 150, 255);
@@ -160,6 +191,13 @@ impl MusicPlayerApp {
         tray_requests: Arc<Mutex<(bool, bool)>>,
         wake_ctx: Arc<Mutex<Option<egui::Context>>>,
     ) -> Self {
+        // ДИАГНОСТИКА (временно): каждый запуск пишет в чистый лог, чтобы
+        // старые записи не смешивались с новыми.
+        if let Some(base_dirs) = directories::BaseDirs::new() {
+            let path = base_dirs.config_dir().join("EndlessDream").join("debug.log");
+            let _ = std::fs::write(&path, "");
+        }
+
         // Быстрая синхронная загрузка (крошечный JSON) — а вот сами треки
         // восстанавливаем асинхронно ниже: read_track() читает теги КАЖДОГО
         // файла, и на большой библиотеке это не должно блокировать первый кадр.
@@ -199,7 +237,12 @@ impl MusicPlayerApp {
             last_seek_time: None,
 
             play_mode: PlayMode::Normal,
-            last_track_switch: Instant::now() - Duration::from_secs(1),
+            // Не `Instant::now() - Duration`: на системах с малым uptime
+            // такое вычитание может выйти за пределы представления Instant
+            // и запаниковать при старте.
+            last_track_switch: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
             error_streak: 0,
 
             current_cover_texture: None,
@@ -373,7 +416,8 @@ impl MusicPlayerApp {
 
         // Ошибки декодирования обрабатываем отдельно: иначе битый плейлист
         // в RepeatAll будет бесконечно перезапускаться на каждом кадре.
-        if audio_state.error.is_some() {
+        // Перемотка тоже пишет `error`, но переключать из-за неё трек нельзя.
+        if audio_state.error.is_some() && audio_state.error_is_fatal {
             const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
             if self.error_streak < MAX_CONSECUTIVE_ERRORS {
@@ -470,11 +514,12 @@ impl MusicPlayerApp {
             Ok(track) => {
                 // Дубликат — либо тот же файл (путь совпадает), либо
                 // другой файл с теми же тегами (название/исполнитель/
-                // длительность). Такие треки пропускаем.
+                // альбом/длительность). Такие треки пропускаем.
                 if self.tracks.iter().any(|t| {
                     t.path == track.path
                         || (t.title == track.title
                             && t.artist == track.artist
+                            && t.album == track.album
                             && t.duration == track.duration)
                 }) {
                     continue;
@@ -1177,6 +1222,8 @@ while self.cover_textures.len() > MAX_COVERS {
             self.selected_track = Some(index);
         }
         if let Some(index) = double_clicked_index {
+            // Ручной запуск начинает серию ошибок заново.
+            self.error_streak = 0;
             self.play_track(&ctx, index);
         }
     }
@@ -1399,12 +1446,18 @@ while self.cover_textures.len() > MAX_COVERS {
                             center.add_space(10.0 * layout_scale);
 
                             if skip_button(center, true, 32.0 * layout_scale) {
+                                // Ручное переключение сбрасывает серию ошибок;
+                                // авто-переключение (advance_after_finish) — нет.
+                                self.error_streak = 0;
                                 self.next_track(&ctx);
                             }
 
                             center.add_space(4.0 * layout_scale);
 
                             if play_pause_button(center, audio_state.is_playing, 48.0 * layout_scale) {
+                                // Ручное действие пользователя — начинаем счёт
+                                // ошибок заново.
+                                self.error_streak = 0;
                                 if audio_state.is_playing {
                                     self.audio.send(AudioCommand::Pause);
                                 } else if audio_state.is_paused {
@@ -1419,6 +1472,7 @@ while self.cover_textures.len() > MAX_COVERS {
                             center.add_space(4.0 * layout_scale);
 
                             if skip_button(center, false, 32.0 * layout_scale) {
+                                self.error_streak = 0;
                                 self.prev_track(&ctx);
                             }
                         },
@@ -1472,6 +1526,23 @@ if volume_response.dragged() || volume_response.clicked() {
 impl eframe::App for MusicPlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // ДИАГНОСТИКА (временно): состояние окна только когда есть повод —
+        // иначе запись в файл на каждом кадре тормозит UI-поток.
+        let close_requested_now = ctx.input(|i| i.viewport().close_requested());
+        if close_requested_now || self.quitting {
+            debug_log(&format!(
+                "[pid={}] CLOSE: close_requested={} visible={:?} minimized={:?} \
+                 focused={} tray={} enabled={} quitting={}",
+                std::process::id(),
+                close_requested_now,
+                ctx.input(|i| i.viewport().visible()),
+                ctx.input(|i| i.viewport().minimized),
+                ctx.input(|i| i.focused),
+                self.tray.is_some(),
+                self.tray_enabled,
+                self.quitting,
+            ));
+        }
         // Гасим белые tooltip'ы: тёмный фон в стиле приложения.
         // В egui 0.34 tooltip берёт цвета из Style::visuals, но не все
         // переопределения из main.rs долетают до него (Frame::popup
@@ -1515,11 +1586,14 @@ impl eframe::App for MusicPlayerApp {
         // Крестик.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && self.tray.is_some() && self.tray_enabled && !self.quitting {
+            debug_log("before CancelClose");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            debug_log("before Visible(false)");
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             // Сворачивание в трей не завершает процесс — Drop ещё не
             // вызовется, поэтому сохраняем явно, здесь единственный шанс.
-            self.save_state_now();
+            // self.save_state_now();  // TEMP: тест, не блокировать UI
+            debug_log("after close handling");
         }
 
         if want_show {

@@ -37,6 +37,9 @@ pub struct AudioState {
     /// В отличие от `position >= duration`, работает и при нулевой/неверной
     /// длительности.
     pub finished: bool,
+    /// Ошибка относится к воспроизведению (Play/Sink), а не к перемотке.
+    /// Только такие ошибки должны автоматически переключать трек.
+    pub error_is_fatal: bool,
 }
 
 impl Default for AudioState {
@@ -49,6 +52,7 @@ impl Default for AudioState {
             volume: 0.7,
             error: None,
             finished: false,
+            error_is_fatal: false,
         }
     }
 }
@@ -77,6 +81,10 @@ impl AudioController {
         if self.command_tx.send(command).is_err() {
             if let Ok(mut state) = self.state.lock() {
                 state.error = Some("Аудиопоток завершился".to_string());
+                state.error_is_fatal = true;
+                state.is_playing = false;
+                state.is_paused = false;
+                state.finished = false;
             }
         }
     }
@@ -93,6 +101,10 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
         Err(err) => {
             if let Ok(mut state) = shared_state.lock() {
                 state.error = Some(format!("Не удалось открыть аудиоустройство: {err}"));
+                state.error_is_fatal = true;
+                state.is_playing = false;
+                state.is_paused = false;
+                state.finished = false;
             }
             return;
         }
@@ -109,11 +121,18 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                     path,
                     fallback_duration,
                 } => {
-                    // Сбрасываем «доиграл» сразу при получении команды, ещё до
-                    // открытия файла: иначе UI успеет увидеть старое значение
-                    // и перескочить через трек, пока декодер только открывается.
+                    // Сбрасываем состояние прошлого трека сразу при получении
+                    // команды, ещё до открытия файла: иначе UI успеет увидеть
+                    // старое «играет»/«доиграл» и перескочить через трек,
+                    // пока декодер только открывается.
                     if let Ok(mut state) = shared_state.lock() {
+                        state.error = None;
+                        state.error_is_fatal = false;
                         state.finished = false;
+                        state.is_playing = false;
+                        state.is_paused = false;
+                        state.position = Duration::ZERO;
+                        state.duration = fallback_duration;
                     }
 
                     if let Some(old_sink) = sink.take() {
@@ -167,6 +186,7 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                                                 state.duration = duration;
                                                 state.volume = volume;
                                                 state.error = None;
+                                                state.error_is_fatal = false;
                                                 state.finished = false;
                                             }
                                         }
@@ -235,6 +255,8 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
                         state.position = Duration::ZERO;
                         state.duration = Duration::ZERO;
                         state.finished = false;
+                        state.error = None;
+                        state.error_is_fatal = false;
                     }
                 }
 
@@ -250,8 +272,28 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
 
                 AudioCommand::Seek(position) => {
                     if let Some(ref current_sink) = sink {
-                        if let Err(err) = current_sink.try_seek(position) {
-                            set_error(&shared_state, format!("Ошибка перемотки: {err}"));
+                        match current_sink.try_seek(position) {
+                            Ok(()) => {
+                                if let Ok(mut state) = shared_state.lock() {
+                                    // Успешная перемотка отменяет «доиграл»:
+                                    // иначе UI может переключить трек, пока
+                                    // аудиопоток ещё не обновил позицию.
+                                    state.error = None;
+                                    state.error_is_fatal = false;
+                                    state.finished = false;
+                                    state.position = position;
+                                }
+                            }
+                            Err(err) => {
+                                // Ошибка перемотки не должна приводить к
+                                // автопереключению трека — помечаем как
+                                // нефатальную.
+                                if let Ok(mut state) = shared_state.lock() {
+                                    state.error = Some(format!("Ошибка перемотки: {err}"));
+                                    state.error_is_fatal = false;
+                                    state.finished = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -288,6 +330,10 @@ fn audio_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<Audi
 fn set_error(shared_state: &Arc<Mutex<AudioState>>, message: String) {
     if let Ok(mut state) = shared_state.lock() {
         state.error = Some(message);
+        state.error_is_fatal = true;
+        // Ошибка воспроизведения: звука нет, UI не должен показывать «играет».
+        state.is_playing = false;
+        state.is_paused = false;
         // Ошибка обрабатывается отдельной веткой UI; не даём старому
         // «finished» инициировать ещё одно переключение.
         state.finished = false;

@@ -296,9 +296,12 @@ fn focus_existing_instance() {
 
     // Ищем окно с нашим заголовком, но проверяем, что оно принадлежит именно
     // этому exe: иначе можно развернуть чужое приложение с тем же именем.
+    // Ограничиваем число проверяемых окон, чтобы патологический случай
+    // (сотни одноимённых окон) не подвешивал запуск.
+    const MAX_WINDOWS_TO_CHECK: usize = 64;
     let mut after: HWND = std::ptr::null_mut();
     let mut found: HWND = std::ptr::null_mut();
-    loop {
+    for _ in 0..MAX_WINDOWS_TO_CHECK {
         after = unsafe {
             FindWindowExW(
                 std::ptr::null_mut(),
