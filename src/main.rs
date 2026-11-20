@@ -11,19 +11,17 @@ pub(crate) type TrayHandle = std::thread::JoinHandle<()>;
 pub(crate) type TrayHandle = tray_icon::TrayIcon;
 
 use eframe::egui;
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem},
     Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 use ui::MusicPlayerApp;
  
-const TRAY_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/tray_icon.png");
-/// Иконка окна и панели задач (PNG рядом с исходниками).
-const APP_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png");
+// Иконки встроены в .exe через include_bytes! — работают с любого ПК,
+// из любой папки, без assets/ рядом с exe.
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/tray_icon.png");
+const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 
 /// Возвращает сохранённый egui::Context.
 fn get_wake_ctx(
@@ -33,36 +31,21 @@ fn get_wake_ctx(
 }
 
 /// Загружает PNG и преобразует его в RGBA-иконку tray-icon.
-fn load_tray_icon(path: &str) -> Option<Icon> {
-    let decoded = match image::open(Path::new(path)) {
-        Ok(image) => image,
-        Err(error) => {
-            eprintln!("Не удалось загрузить иконку трея из '{path}': {error}");
-            return None;
-        }
-    };
-
+fn load_tray_icon(bytes: &[u8]) -> Option<Icon> {
+    let decoded = image::load_from_memory(bytes).ok()?;
     let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
 
-    match Icon::from_rgba(rgba.into_raw(), width, height) {
-        Ok(icon) => Some(icon),
-        Err(error) => {
-            eprintln!("Некорректная PNG-иконка трея '{path}': {error}");
-            None
-        }
-    }
+    Icon::from_rgba(rgba.into_raw(), width, height).ok()
 }
-
-fn load_window_icon(path: &str) -> Option<egui::IconData> {
-    let decoded = match image::open(Path::new(path)) {
+fn load_window_icon(bytes: &[u8]) -> Option<egui::IconData> {
+    let decoded = match image::load_from_memory(bytes) {
         Ok(image) => image,
         Err(error) => {
-            eprintln!("Не удалось загрузить иконку окна из '{path}': {error}");
+            eprintln!("Не удалось загрузить иконку окна: {error}");
             return None;
         }
     };
-
     const MAX_SIDE: u32 = 256;
     let mut rgba = decoded.into_rgba8();
     if rgba.width() > MAX_SIDE || rgba.height() > MAX_SIDE {
@@ -82,6 +65,163 @@ fn load_window_icon(path: &str) -> Option<egui::IconData> {
     })
 }
 
+/// Ставит иконку окну приложения (и кнопке на панели задач) напрямую.
+///
+/// eframe ищет окно через `GetActiveWindow()`, а он возвращает NULL, пока
+/// окно не получило фокус: при запуске из терминала окно открывается без
+/// активации, `WM_SETICON` не вызывается — и кнопка на панели задач остаётся
+/// с пустой иконкой. Здесь окно ищется по PID, поэтому фокус не нужен.
+///
+/// Возвращает `true`, когда иконка установлена. `false` означает, что окна
+/// ещё нет (или не удалось собрать HICON) — нужно повторить позже.
+#[cfg(target_os = "windows")]
+pub(crate) fn apply_window_icon(icon: &egui::IconData) -> bool {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetSystemMetrics, GetWindowThreadProcessId, IsWindowVisible, SendMessageW,
+        ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON, WM_GETICON, WM_SETICON,
+    };
+
+    struct Search {
+        pid: u32,
+        hwnd: HWND,
+    }
+
+    unsafe extern "system" fn find_own_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(lparam as *mut Search) };
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+        }
+        if pid == search.pid && unsafe { IsWindowVisible(hwnd) } != 0 {
+            search.hwnd = hwnd;
+            return 0; // нашли — дальше не перебираем
+        }
+        1
+    }
+
+    /// Собирает HICON нужного размера из RGBA-данных иконки.
+    fn make_hicon(rgba: &image::RgbaImage, size: i32) -> isize {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateIconFromResourceEx, LR_DEFAULTCOLOR,
+        };
+
+        let scaled = image::imageops::resize(
+            rgba,
+            size as u32,
+            size as u32,
+            image::imageops::Lanczos3,
+        );
+
+        let mut png: Vec<u8> = Vec::new();
+        let encoded = image::DynamicImage::ImageRgba8(scaled).write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageFormat::Png,
+        );
+        if encoded.is_err() {
+            return 0;
+        }
+
+        // Тот же приём, что в eframe: `CreateIconFromResourceEx` понимает PNG
+        // и сам собирает из него HICON с корректной альфой.
+        unsafe {
+            CreateIconFromResourceEx(
+                png.as_ptr(),
+                png.len() as u32,
+                1,           // ficon: это иконка, а не курсор
+                0x0003_0000, // версия ресурса иконки
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            ) as isize
+        }
+    }
+
+    let Some(rgba) = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone()) else {
+        return false;
+    };
+
+    let mut search = Search {
+        pid: std::process::id(),
+        hwnd: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(Some(find_own_window), &mut search as *mut Search as LPARAM);
+    }
+    if search.hwnd.is_null() {
+        return false;
+    }
+
+    // Была ли иконка у окна ДО нас. Если её не было, Explorer мог запомнить
+    // для этой кнопки «пустую» иконку и продолжит рисовать её даже после
+    // WM_SETICON — тогда кэш нужно сбросить (см. ниже).
+    let had_icon = unsafe { SendMessageW(search.hwnd, WM_GETICON, ICON_BIG as usize, 0) } != 0;
+
+    // Сначала большая иконка (панель задач), потом маленькая (заголовок):
+    // в этом порядке советует eframe, иначе Windows плохо масштабирует.
+    let big = unsafe { GetSystemMetrics(SM_CXICON) };
+    let small = unsafe { GetSystemMetrics(SM_CXSMICON) };
+
+    let mut applied = true;
+    for (size, kind) in [(big, ICON_BIG), (small, ICON_SMALL)] {
+        let hicon = make_hicon(&rgba, size);
+        if hicon == 0 {
+            applied = false;
+            continue;
+        }
+        unsafe {
+            SendMessageW(search.hwnd, WM_SETICON, kind as usize, hicon);
+        }
+    }
+
+    // Чиним последствия «жизни без иконки»: сбрасываем кэш оболочки ровно
+    // один раз и только если иконки не было. На нормальном запуске (окно
+    // получило фокус, eframe успел поставить иконку) сброса не будет.
+    if applied && !had_icon {
+        refresh_shell_icon_cache_once();
+    }
+
+    applied
+}
+
+/// Просит оболочку Windows перечитать кэш иконок — один раз на установку.
+///
+/// Explorer кэширует иконку кнопки по идентичности приложения. Если приложение
+/// какое-то время работало без иконки, в кэш попадает «пустой лист», и он
+/// переживает WM_SETICON — кнопка остаётся серой до перезапуска проводника.
+/// `SHCNE_ASSOCCHANGED` инвалидирует этот кэш; это то же самое, что делает
+/// `ie4uinit.exe -show`.
+///
+/// Сброс затрагивает иконки всей оболочки, поэтому делаем его однократно:
+/// после этой сборки окно всегда получает иконку само, и кэш портить больше
+/// нечему. Признак «уже сбрасывали» — файл-маркер рядом с state.json;
+/// сам state.json не трогаем.
+#[cfg(target_os = "windows")]
+fn refresh_shell_icon_cache_once() {
+    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+
+    let Some(base_dirs) = directories::BaseDirs::new() else {
+        return;
+    };
+    let dir = base_dirs.config_dir().join("EndlessDream");
+    let marker = dir.join("icon-cache-refreshed");
+    if marker.exists() {
+        return;
+    }
+
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+    }
+
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&marker, b"");
+}
+
 /// Создаёт меню и сам TrayIcon. Вызывается в подходящем для платформы потоке.
 fn build_tray(icon: Icon) -> Result<(tray_icon::TrayIcon, MenuId, MenuId), String> {
     let show_item = MenuItem::new("Показать", true, None);
@@ -91,29 +231,34 @@ fn build_tray(icon: Icon) -> Result<(tray_icon::TrayIcon, MenuId, MenuId), Strin
     let quit_item_id = quit_item.id().clone();
 
     let menu = Menu::new();
+
     menu.append(&show_item)
-        .map_err(|error| format!("не удалось добавить пункт «Показать»: {error}"))?;
+        .map_err(|error| format!("не удалось добавить пункт меню «Показать»: {error}"))?;
     menu.append(&quit_item)
-        .map_err(|error| format!("не удалось добавить пункт «Выход»: {error}"))?;
+        .map_err(|error| format!("не удалось добавить пункт меню «Выход»: {error}"))?;
 
     let builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(icon)
         .with_tooltip("Endless Dream");
 
-    // В Windows левый клик восстанавливает окно, контекстное меню — по правому клику.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let builder = builder.with_menu_on_left_click(false);
 
-    let tray = builder
-        .build()
-        .map_err(|error| format!("не удалось создать TrayIcon: {error}"))?;
+    let tray = builder.build().map_err(|error| {
+        format!(
+            "Windows отказала в регистрации иконки трея: {error}. \
+             Обычно это значит, что процесс запущен с пониженной целостностью \
+             (Low IL): так бывает, если папка с .exe помечена как Low или \
+             приложение запущено внутри песочницы"
+        )
+    })?;
 
     Ok((tray, show_item_id, quit_item_id))
 }
 
 #[cfg(target_os = "linux")]
-fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
+pub(crate) fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
     let (sender, receiver) =
         std::sync::mpsc::sync_channel::<Result<(MenuId, MenuId), String>>(1);
 
@@ -126,8 +271,7 @@ fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
                 let _ = sender.send(Err(message));
                 return;
             }
-
-            let tray_result = match load_tray_icon(TRAY_ICON_PATH) {
+            let tray_result = match load_tray_icon(TRAY_ICON_BYTES) {
                 Some(icon) => build_tray(icon),
                 None => Err("файл иконки трея недоступен".to_owned()),
             };
@@ -178,8 +322,8 @@ fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
 // На Windows/macOS иконка создаётся из AppCreator: это тот же поток, в котором
 // работает eframe. На macOS так гарантируется, что NSApp уже инициализирован.
 #[cfg(not(target_os = "linux"))]
-fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
-    let Some(icon) = load_tray_icon(TRAY_ICON_PATH) else {
+pub(crate) fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
+    let Some(icon) = load_tray_icon(TRAY_ICON_BYTES) else {
         return (None, None, None);
     };
 
@@ -188,7 +332,9 @@ fn create_tray() -> (Option<TrayHandle>, Option<MenuId>, Option<MenuId>) {
             (Some(tray), Some(show_item_id), Some(quit_item_id))
         }
         Err(error) => {
-            eprintln!("Не удалось создать трей: {error}");
+            // Трей не критичен для работы плеера: сообщение увидит UI,
+            // а здесь оставляем след для запуска из терминала.
+            eprintln!("{error}");
             (None, None, None)
         }
     }
@@ -286,9 +432,9 @@ unsafe fn window_belongs_to_current_exe(
 #[cfg(target_os = "windows")]
 fn focus_existing_instance() {
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+// (убрал AttachThreadInput, GetCurrentThreadId)
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, FindWindowExW, GetForegroundWindow, GetWindowThreadProcessId,
+        BringWindowToTop, FindWindowExW,
         SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
     };
 
@@ -328,26 +474,75 @@ fn focus_existing_instance() {
         ShowWindow(found, SW_SHOW);
         ShowWindow(found, SW_RESTORE);
 
-        // SetForegroundWindow может не сработать из-за foreground-lock.
-        // Присоединяемся к потоку текущего foreground-окна, чтобы обойти его.
-        let foreground = GetForegroundWindow();
-        let foreground_thread = if foreground.is_null() {
-            0
-        } else {
-            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
-        };
-        let current_thread = GetCurrentThreadId();
-        let attached = foreground_thread != 0
-            && foreground_thread != current_thread
-            && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
-
+        // Без AttachThreadInput: это focus-stealing паттерн, Defender
+        // считает его подозрительным (так делают malware/overlay).
         BringWindowToTop(found);
         SetForegroundWindow(found);
-
-        if attached {
-            AttachThreadInput(current_thread, foreground_thread, 0);
-        }
     }
+}
+
+/// Сигналит уже запущенному экземпляру показать себя — через именованное
+/// событие, а не напрямую через WinAPI (см. комментарий в `main()`).
+/// Если по какой-то причине событие не открылось (например, первый
+/// экземпляр ещё не успел его создать), откатываемся на старый способ —
+/// лучше окно "грубо" развернётся, чем не развернётся вообще.
+#[cfg(target_os = "windows")]
+fn signal_existing_instance_to_show() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+
+    let name: Vec<u16> = "Local\\EndlessDream.ShowEvent\0"
+        .encode_utf16()
+        .collect();
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+
+    if handle.is_null() {
+        focus_existing_instance();
+        return;
+    }
+
+    unsafe {
+        SetEvent(handle);
+        CloseHandle(handle);
+    }
+}
+
+/// Создаёт именованное событие и запускает поток, который ждёт сигнала от
+/// второго запуска exe (`signal_existing_instance_to_show`) и, получив его,
+/// просит окно показаться тем же путём, что и левый клик по иконке трея —
+/// через `tray_requests` + пробуждение контекста. Это гарантирует, что
+/// winit/egui увидят показ окна через свой собственный механизм, а не в
+/// обход него через прямой ShowWindow из чужого процесса.
+#[cfg(target_os = "windows")]
+fn spawn_show_signal_listener(
+    tray_requests: Arc<Mutex<(bool, bool)>>,
+    wake_ctx: Arc<Mutex<Option<egui::Context>>>,
+) {
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+
+    let name: Vec<u16> = "Local\\EndlessDream.ShowEvent\0"
+        .encode_utf16()
+        .collect();
+    // Автосброс (bManualReset = 0): каждый сигнал обрабатывается один раз.
+    let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if handle.is_null() {
+        // Не смогли создать событие — второй запуск просто откатится на
+        // старый способ (focus_existing_instance) сам по себе.
+        return;
+    }
+
+    std::thread::spawn(move || loop {
+        // WAIT_OBJECT_0 == 0.
+        if unsafe { WaitForSingleObject(handle, INFINITE) } != 0 {
+            break;
+        }
+        if let Ok(mut req) = tray_requests.lock() {
+            req.0 = true;
+        }
+        if let Some(ctx) = get_wake_ctx(&wake_ctx) {
+            ctx.request_repaint();
+        }
+    });
 }
 
 fn main() -> eframe::Result<()> {
@@ -357,7 +552,18 @@ fn main() -> eframe::Result<()> {
     let _single_instance = match acquire_single_instance() {
         Some(guard) => guard,
         None => {
-            focus_existing_instance();
+            // ВАЖНО: раньше здесь напрямую звали ShowWindow/SetForegroundWindow
+            // по чужому HWND. Это меняет видимость окна в обход winit —
+            // winit (в первом процессе) не знает, что окно показали, и
+            // продолжает считать его скрытым. Из-за этого следующий клик
+            // по крестику ломался: CancelClose срабатывал, а повторный
+            // Visible(false) был уже «неотличим» от текущего состояния —
+            // окно оставалось открытым, будто клика не было.
+            // Теперь вместо прямого WinAPI-вызова просто сигналим первому
+            // процессу через именованное событие — он сам покажет себя
+            // тем же путём, что и клик по иконке трея (через tray_requests),
+            // и состояние winit останется согласованным.
+            signal_existing_instance_to_show();
             return Ok(());
         }
     };
@@ -367,7 +573,13 @@ fn main() -> eframe::Result<()> {
     // (show, quit) — запросы из трея, применяются на UI-потоке в update().
     let tray_requests: Arc<Mutex<(bool, bool)>> =
         Arc::new(Mutex::new((false, false)));
-       
+
+    // Слушаем сигнал от второго запуска exe (см. signal_existing_instance_to_show)
+    // и показываем окно тем же путём, что и клик по трею — через tray_requests,
+    // а не напрямую через WinAPI, чтобы не расходиться с состоянием winit.
+    #[cfg(target_os = "windows")]
+    spawn_show_signal_listener(Arc::clone(&tray_requests), Arc::clone(&wake_ctx));
+
     // ID пунктов меню нужны обработчику, который регистрируется до run_native.
     let menu_item_ids: Arc<Mutex<Option<(MenuId, MenuId)>>> =
         Arc::new(Mutex::new(None));
@@ -448,7 +660,8 @@ fn main() -> eframe::Result<()> {
 
     // Иконка окна/панели задач. Если файл недоступен — просто стартуем с
     // системной иконкой, это не ошибка.
-    if let Some(icon) = load_window_icon(APP_ICON_PATH) {
+    let window_icon = load_window_icon(APP_ICON_BYTES);
+    if let Some(icon) = window_icon.clone() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -461,6 +674,12 @@ fn main() -> eframe::Result<()> {
         "Endless Dream",
         options,
         Box::new(move |cc| {
+            // Приложение всегда тёмное. Без этого egui 0.34 следовал системной
+            // теме Windows (у нас включена светлая), и стандартные виджеты —
+            // включая ползунок прокрутки — получали цвета Visuals::light():
+            // серый в покое и чёрный при наведении, то есть «исчезали».
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
+
             // Компактная тёмная тема.
             let mut style = (*cc.egui_ctx.global_style()).clone();
 
@@ -536,7 +755,6 @@ monospace.insert(0, PIXEL_FONT_NAME.to_owned());
 
             #[cfg(target_os = "linux")]
             let (tray, _, _) = tray_setup;
-
             #[cfg(not(target_os = "linux"))]
             let (tray, show_item_id, quit_item_id) = create_tray();
 
@@ -555,6 +773,8 @@ monospace.insert(0, PIXEL_FONT_NAME.to_owned());
                  tray,
                 Arc::clone(&tray_requests),
                 Arc::clone(&wake_ctx),
+                window_icon,
+                Arc::clone(&menu_item_ids),
             )))
         }),
     )

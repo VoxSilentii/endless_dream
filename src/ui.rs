@@ -1,48 +1,20 @@
 // ui.rs
 use crate::audio::{AudioCommand, AudioController, AudioState};
-use crate::library::{self as library, format_duration, scan_directory, Track};
+use crate::library::{
+    self as library, format_duration, scan_directory, Track, SUPPORTED_AUDIO_EXT,
+};
 use crate::TrayHandle;
 use crate::state::{self, SavedState};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use tray_icon::menu::MenuId;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex, OnceLock};
-
-/// Момент старта процесса — для временных меток в debug.log.
-static DEBUG_LOG_START: OnceLock<Instant> = OnceLock::new();
-
-/// ДИАГНОСТИКА (временно): дописывает строку в %APPDATA%\EndlessDream\debug.log.
-/// Нужна для разбора бага с системным крестиком при включённом трее.
-fn debug_log(msg: &str) {
-    use std::io::Write as _;
-
-    let Some(base_dirs) = directories::BaseDirs::new() else {
-        return;
-    };
-    let dir = base_dirs.config_dir().join("EndlessDream");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("debug.log"))
-    else {
-        return;
-    };
-
-    let elapsed_ms = DEBUG_LOG_START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_millis();
-    let _ = writeln!(file, "[{elapsed_ms} ms] {msg}");
-}
+use std::sync::{Arc, Mutex};
  
 // ---------- Космическая палитра ----------
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 150, 255);
@@ -52,6 +24,8 @@ const SIDEBAR_BG: egui::Color32 = egui::Color32::from_rgb(10, 10, 15);
 const MUTED_TEXT: egui::Color32 = egui::Color32::from_rgb(120, 130, 150);
 const PRIMARY_TEXT: egui::Color32 = egui::Color32::from_rgb(225, 235, 250);
 const BORDER: egui::Color32 = egui::Color32::from_rgb(35, 43, 65);
+/// Текст ошибки в панели управления (например, «файл слишком большой»).
+const ERROR_TEXT: egui::Color32 = egui::Color32::from_rgb(255, 120, 120);
 /// Тонкая линия-разделитель под заголовками таблицы треков.
 const HEADER_LINE: egui::Color32 = BORDER;
 
@@ -59,10 +33,6 @@ const HEADER_LINE: egui::Color32 = BORDER;
 const PLAY_BTN_BG: egui::Color32 = egui::Color32::from_rgb(60, 80, 150);
 const PLAY_BTN_BG_HOVER: egui::Color32 = egui::Color32::from_rgb(80, 110, 190);
 const BUTTON_BORDER: egui::Color32 = egui::Color32::from_rgb(20, 30, 50);
-
-const SUPPORTED_AUDIO_EXT: &[&str] = &[
-    "mp3", "flac", "wav", "ogg", "oga", "opus", "aac", "m4a", "aiff", "aif",
-];
 
 /// Режим повтора воспроизведения.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +76,8 @@ pub struct MusicPlayerApp {
     tray: Option<TrayHandle>,
     /// Масштаб интерфейса, изменяемый сочетанием Ctrl + колесо мыши.
     ui_scale: f32,
+    /// Последняя папка из диалога выбора файлов/папки (запоминается в state.json).
+    last_opened_dir: Option<PathBuf>,
 
     // Канал получения результата фонового сканирования.
     scan_receiver: Option<Receiver<Result<Vec<Track>, String>>>,
@@ -128,9 +100,6 @@ pub struct MusicPlayerApp {
     /// Сколько треков подряд завершились ошибкой. Нужно, чтобы плейлист из
     /// битых файлов не крутился бесконечно в RepeatAll.
     error_streak: u32,
-
-    /// Пиксельная обложка текущего трека (64x64 → 128x128, Nearest).
-    current_cover_texture: Option<egui::TextureHandle>,
 
     /// Ленивая GPU-кэш-таблица миниатюр для видимых строк плейлиста.
     /// В HashMap также храним None, чтобы не перечитывать файл без обложки.
@@ -170,7 +139,13 @@ pub struct MusicPlayerApp {
     central_rect: egui::Rect,
         /// Канал фонового восстановления треков из прошлой сессии — не блокирует
     /// первый кадр. См. `MusicPlayerApp::new()` и `update_restore()`.
-    restore_receiver: Option<Receiver<Vec<Track>>>,
+    restore_receiver: Option<Receiver<Track>>,
+    /// Пути из state.json, пока восстановление не закончилось. Нужны, чтобы
+    /// выход в этот момент не сохранил плейлист частично.
+    saved_playlist_paths: Vec<PathBuf>,
+    /// Пути из прошлой сессии, которые не прочитались (диск отключён, файл
+    /// недоступен). Сохраняются обратно, чтобы такие треки не пропали.
+    missing_playlist_paths: Vec<PathBuf>,
     /// Когда в последний раз пробовали сделать периодическое сохранение.
     last_periodic_save: Instant,
     /// Хэш последнего УЖЕ сохранённого состояния — чтобы периодическое
@@ -181,6 +156,17 @@ pub struct MusicPlayerApp {
     /// закрыть окно (иначе выйти через меню трея при включённом
     /// tray_enabled было бы невозможно).
     quitting: bool,
+    /// Крестик нажат, закрытие отменено (трей включён) — но прятать окно
+    /// нужно не в этом же кадре, а в следующем (см. комментарий в `ui()`).
+    pending_hide_to_tray: bool,
+    /// Иконка окна. Ставим её сами, не полагаясь на eframe: см.
+    /// `MusicPlayerApp::ui()` и `apply_window_icon()` в main.rs.
+    window_icon: Option<egui::IconData>,
+    /// Иконка уже применена к окну — повторять каждый кадр не нужно.
+    icon_applied: bool,
+    /// ID пунктов меню трея. Нужны обработчику меню в main.rs; заполняются
+    /// при создании трея (при старте или на лету при включении галочки).
+    menu_item_ids: Arc<Mutex<Option<(MenuId, MenuId)>>>,
 }
 
 
@@ -190,31 +176,36 @@ impl MusicPlayerApp {
         tray: Option<TrayHandle>,
         tray_requests: Arc<Mutex<(bool, bool)>>,
         wake_ctx: Arc<Mutex<Option<egui::Context>>>,
+        window_icon: Option<egui::IconData>,
+        menu_item_ids: Arc<Mutex<Option<(MenuId, MenuId)>>>,
     ) -> Self {
-        // ДИАГНОСТИКА (временно): каждый запуск пишет в чистый лог, чтобы
-        // старые записи не смешивались с новыми.
-        if let Some(base_dirs) = directories::BaseDirs::new() {
-            let path = base_dirs.config_dir().join("EndlessDream").join("debug.log");
-            let _ = std::fs::write(&path, "");
-        }
-
         // Быстрая синхронная загрузка (крошечный JSON) — а вот сами треки
         // восстанавливаем асинхронно ниже: read_track() читает теги КАЖДОГО
         // файла, и на большой библиотеке это не должно блокировать первый кадр.
         let saved_state = state::load_state();
 
-        let restore_receiver = saved_state.as_ref().and_then(|saved| {
-            if saved.track_paths.is_empty() {
-                return None;
-            }
+        // Список путей прошлой сессии держим до конца восстановления:
+        // пока треки не прочитаны, сохранять `tracks` нельзя (см.
+        // `finalize_restore` и `save_state_now`).
+        let saved_playlist_paths: Vec<PathBuf> = saved_state
+            .as_ref()
+            .map(|saved| saved.track_paths.clone())
+            .unwrap_or_default();
+
+        let restore_receiver = if saved_playlist_paths.is_empty() {
+            None
+        } else {
             let (tx, rx) = mpsc::channel();
-            let paths = saved.track_paths.clone();
+            let paths = saved_playlist_paths.clone();
             thread::spawn(move || {
-                let tracks = state::restore_tracks(&paths);
-                let _ = tx.send(tracks);
+                // Отдаём треки по одному: список наполняется сразу, а не
+                // после чтения тегов всей библиотеки.
+                for track in state::restore_tracks(&paths) {
+                    let _ = tx.send(track);
+                }
             });
             Some(rx)
-        });
+        };
 
         let app = Self {
             audio: AudioController::new(),
@@ -224,10 +215,13 @@ impl MusicPlayerApp {
             selected_track: None,
             current_track: None,
 
-            status: "Готов".to_string(),
+            status: String::new(),
             volume: saved_state.as_ref().map(|s| s.volume).unwrap_or(0.7),
             tray,
             ui_scale: saved_state.as_ref().map(|s| s.ui_scale).unwrap_or(1.0),
+            last_opened_dir: saved_state
+                .as_ref()
+                .and_then(|saved| saved.last_opened_dir.clone()),
 
             scan_receiver: None,
             is_scanning: false,
@@ -245,7 +239,6 @@ impl MusicPlayerApp {
                 .unwrap_or_else(Instant::now),
             error_streak: 0,
 
-            current_cover_texture: None,
             cover_textures: HashMap::new(),
             wake_ctx,
             tray_requests,
@@ -262,9 +255,15 @@ impl MusicPlayerApp {
             central_rect: egui::Rect::NOTHING,
 
             restore_receiver,
+            saved_playlist_paths,
+            missing_playlist_paths: Vec::new(),
             last_periodic_save: Instant::now(),
             last_saved_signature: 0,
             quitting: false,
+            pending_hide_to_tray: false,
+            window_icon,
+            icon_applied: false,
+            menu_item_ids,
         };
         
         // Синхронизируем аудиопоток с сохранённой громкостью, иначе
@@ -281,9 +280,9 @@ impl MusicPlayerApp {
 
     /// Воспроизведение трека по индексу.
     ///
-    /// Принимает ctx, потому что здесь же декодируется обложка трека в
-    /// пиксельную GPU-текстуру (нужен egui::Context для load_texture).
-    fn play_track(&mut self, ctx: &egui::Context, index: usize) {
+    /// Файлы здесь не читаются: обложку отдаёт ленивый кэш `cover_textures`,
+    /// иначе чтение тегов на UI-потоке подвешивало окно на больших файлах.
+    fn play_track(&mut self, index: usize) {
         if index >= self.tracks.len() {
             return;
         }
@@ -298,16 +297,10 @@ impl MusicPlayerApp {
         self.seek_dragging = false;
         self.last_track_switch = Instant::now();
 
-
-        self.current_cover_texture = library::read_cover(&path)
-            .and_then(|bytes| decode_pixel_cover(ctx, &bytes));
-
         self.audio.send(AudioCommand::Play {
             path,
             fallback_duration,
         });
-
-        self.status = format!("Воспроизведение: {}", self.tracks[index].title);
     }
 
     /// Удаляет трек из плейлиста и корректирует индексы текущего/выбранного трека.
@@ -323,7 +316,6 @@ impl MusicPlayerApp {
 
         if removed_current {
             self.audio.send(AudioCommand::Stop);
-            self.current_cover_texture = None;
         }
 
         self.tracks.remove(index);
@@ -341,11 +333,13 @@ impl MusicPlayerApp {
         };
 
         self.status = "Трек удалён из плейлиста".to_string();
+        // Плейлист изменился — сразу фиксируем, не дожидаясь таймера.
+        self.save_state_if_changed();
     }
 
     /// Следующий трек (ручное нажатие — всегда зацикливается, независимо
     /// от play_mode; режим повтора влияет только на авто-переключение).
-    fn next_track(&mut self, ctx: &egui::Context) {
+    fn next_track(&mut self) {
         if self.tracks.is_empty() {
             return;
         }
@@ -356,11 +350,11 @@ impl MusicPlayerApp {
             None => 0,
         };
 
-        self.play_track(ctx, next_index);
+        self.play_track(next_index);
     }
 
     /// Предыдущий трек.
-    fn prev_track(&mut self, ctx: &egui::Context) {
+    fn prev_track(&mut self) {
         if self.tracks.is_empty() {
             return;
         }
@@ -371,32 +365,38 @@ impl MusicPlayerApp {
             None => 0,
         };
 
-        self.play_track(ctx, prev_index);
+        self.play_track(prev_index);
     }
 
     /// Вызывается, когда трек доиграл до конца сам по себе (не вручную).
     /// В отличие от next_track() учитывает режим повтора.
-    fn advance_after_finish(&mut self, ctx: &egui::Context) {
+    ///
+    /// `false` — переключать некуда (последний трек в Normal): вызывающий
+    /// код снимает залипшее состояние `finished`/`error`.
+    fn advance_after_finish(&mut self) -> bool {
+        let Some(index) = self.current_track else {
+            return false;
+        };
+
         match self.play_mode {
             PlayMode::RepeatOne => {
-                if let Some(index) = self.current_track {
-                    // Перезапускаем тот же трек: шлём Play на тот же путь.
-                    self.play_track(ctx, index);
-                }
+                // Перезапускаем тот же трек: шлём Play на тот же путь.
+                self.play_track(index);
+                true
             }
             PlayMode::RepeatAll => {
                 // next_track() уже зацикливается на первый трек после последнего.
-                self.next_track(ctx);
+                self.next_track();
+                true
             }
             PlayMode::Normal => {
-                if let Some(index) = self.current_track {
-                    if index + 1 < self.tracks.len() {
-                        self.play_track(ctx, index + 1);
-                    } else {
-                        // Последний трек в Normal-режиме — останавливаемся.
-                        self.status = "Плейлист закончен".to_string();
-                        self.last_track_switch = Instant::now();
-                    }
+                if index + 1 < self.tracks.len() {
+                    self.play_track(index + 1);
+                    true
+                } else {
+                    // Последний трек в Normal-режиме — останавливаемся.
+                    self.status = "Плейлист закончен".to_string();
+                    false
                 }
             }
         }
@@ -406,7 +406,7 @@ impl MusicPlayerApp {
     ///
     /// Основной сигнал — `audio_state.finished`: sink действительно опустел.
     /// Это работает и для треков, у которых длительность неизвестна или 0.
-    fn check_track_finished(&mut self, ctx: &egui::Context, audio_state: &AudioState) {
+    fn check_track_finished(&mut self, audio_state: &AudioState) {
         if self.last_track_switch.elapsed() < Duration::from_millis(250) {
             return;
         }
@@ -420,21 +420,39 @@ impl MusicPlayerApp {
         if audio_state.error.is_some() && audio_state.error_is_fatal {
             const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
-            if self.error_streak < MAX_CONSECUTIVE_ERRORS {
-                self.error_streak += 1;
-                self.advance_after_finish(ctx);
-            } else if self.error_streak == MAX_CONSECUTIVE_ERRORS {
-                self.error_streak += 1;
-                self.status = "Слишком много ошибок подряд — воспроизведение остановлено"
-                    .to_string();
-                self.last_track_switch = Instant::now();
+            // Уже остановились после серии ошибок — ждём действия пользователя.
+            if self.error_streak > MAX_CONSECUTIVE_ERRORS {
+                return;
             }
+
+            if self.error_streak == MAX_CONSECUTIVE_ERRORS || !self.advance_after_finish() {
+                // Переключать некуда или ошибок слишком много: сообщаем один
+                // раз и снимаем залипший fatal-флаг через Stop, иначе эта
+                // ветка будет срабатывать на каждом кадре.
+                self.status = if self.error_streak == MAX_CONSECUTIVE_ERRORS {
+                    "Слишком много ошибок подряд — воспроизведение остановлено".to_string()
+                } else {
+                    audio_state
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Воспроизведение остановлено".to_string())
+                };
+                self.error_streak = MAX_CONSECUTIVE_ERRORS + 1;
+                self.audio.send(AudioCommand::Stop);
+                return;
+            }
+
+            self.error_streak += 1;
             return;
         }
         self.error_streak = 0;
 
         if audio_state.finished {
-            self.advance_after_finish(ctx);
+            if !self.advance_after_finish() {
+                // Плейлист закончился: снимаем залипший `finished`,
+                // иначе автопереход срабатывал бы и дальше.
+                self.audio.send(AudioCommand::Stop);
+            }
             return;
         }
 
@@ -460,11 +478,35 @@ impl MusicPlayerApp {
             && audio_state.position.as_secs_f32() >= duration_secs - 0.5;
 
         if finished {
-            self.advance_after_finish(ctx);
+            // `finished` здесь false, снимать нечего: просто дублируем
+            // обработку на случай, если сигнал от аудиопотока не дошёл.
+            self.advance_after_finish();
         }
     }
 
     // ---------- Выбор файлов/папок ----------
+
+    /// Папка, с которой открывать диалог: последняя выбранная, иначе папка
+    /// первого трека плейлиста. Несуществующие пути пропускаем.
+    fn dialog_start_dir(&self) -> Option<PathBuf> {
+        self.last_opened_dir
+            .as_ref()
+            .filter(|dir| dir.is_dir())
+            .cloned()
+            .or_else(|| {
+                self.tracks
+                    .first()
+                    .and_then(|track| track.path.parent())
+                    .filter(|dir| dir.is_dir())
+                    .map(|dir| dir.to_path_buf())
+            })
+    }
+
+    /// Запоминает папку, выбранную в диалоге, и сразу пишет её в state.json.
+    fn remember_opened_dir(&mut self, dir: &Path) {
+        self.last_opened_dir = Some(dir.to_path_buf());
+        self.save_state_if_changed();
+    }
 
     /// Выбор папки через системный диалог.
     fn choose_directory(&mut self) {
@@ -472,29 +514,46 @@ impl MusicPlayerApp {
             return;
         }
 
-        let directory = rfd::FileDialog::new()
-            .set_title("Выберите папку с музыкой")
-            .pick_folder();
+        let mut dialog = rfd::FileDialog::new().set_title("Выберите папку с музыкой");
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
 
-        if let Some(directory) = directory {
+        if let Some(directory) = dialog.pick_folder() {
+            self.remember_opened_dir(&directory);
             self.start_scan(directory);
         }
     }
 
     /// Выбор отдельных аудиофайлов через системный диалог (с фильтром).
     fn choose_files(&mut self) {
-        let files = rfd::FileDialog::new()
-            .set_title("Выберите аудиофайлы")
-            .add_filter("Аудио", SUPPORTED_AUDIO_EXT)
-            .pick_files();
+        // Результат сканирования заменит плейлист целиком и сотрёт добавленное.
+        if self.is_scanning {
+            return;
+        }
 
-        if let Some(paths) = files {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Выберите аудиофайлы")
+            .add_filter("Аудио", SUPPORTED_AUDIO_EXT);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+
+        if let Some(paths) = dialog.pick_files() {
+            if let Some(parent) = paths.first().and_then(|path| path.parent()) {
+                self.remember_opened_dir(parent);
+            }
             self.add_files(paths);
         }
     }
 
     /// Добавляет выбранные файлы в конец текущего плейлиста, не затирая старые.
    fn add_files(&mut self, paths: Vec<PathBuf>) {
+    // Пользователь уже выбрал файлы: докатывать старый плейлист в текущую
+    // сессию не нужно, но недосчитанные пути прошлой сессии сохраняем —
+    // иначе они пропадут из state.json навсегда.
+    self.finalize_restore();
+    self.restore_receiver = None;
     let mut added = 0usize;
     let mut rejected_unsupported = 0usize;
     let mut rejected_broken = 0usize;
@@ -525,6 +584,10 @@ impl MusicPlayerApp {
                     continue;
                 }
 
+                // Файл стал доступен — убираем его из недоступных, чтобы
+                // не сохранить один путь дважды.
+                self.missing_playlist_paths
+                    .retain(|missing| missing != &track.path);
                 self.tracks.push(track);
                 added += 1;
             }
@@ -541,10 +604,20 @@ impl MusicPlayerApp {
         (a, 0, b) => format!("Добавлено: {a}, отклонено (битые): {b}"),
         (a, u, b) => format!("Добавлено: {a}, отклонено (формат): {u}, отклонено (битые): {b}"),
     };
+
+    // Плейлист изменился — сразу пишем state.json, не дожидаясь 30 секунд
+    // и не полагаясь на закрытие окна.
+    self.save_state_if_changed();
 }
 
     /// Запуск сканирования в отдельном потоке.
     fn start_scan(&mut self, directory: PathBuf) {
+        // Сканирование заменит плейлист целиком — фоновое восстановление
+        // старого списка больше не нужно. Недосчитанные пути держим до
+        // успешного результата: если сканирование упадёт, плейлист цел.
+        self.finalize_restore();
+        self.restore_receiver = None;
+
         let (tx, rx) = mpsc::channel();
 
         self.scan_receiver = Some(rx);
@@ -576,11 +649,19 @@ impl MusicPlayerApp {
 
                         self.tracks = tracks;
                         self.cover_textures.clear();
-                        self.current_cover_texture = None;
                         self.selected_track = None;
                         self.current_track = None;
+                        // Новый плейлист заменил старый целиком: недоступные
+                        // пути прошлой сессии больше не нужны.
+                        self.missing_playlist_paths.clear();
+                        // Старый трек в новом списке отсутствует — без Stop
+                        // он играл бы без строки и без автоперехода.
+                        self.audio.send(AudioCommand::Stop);
 
                         self.status = format!("Загружено треков: {}", count);
+                        // Новый плейлист сразу сохраняем: раньше запись
+                        // ждала 30-секундного таймера или закрытия окна.
+                        self.save_state_if_changed();
                     }
                     Err(err) => {
                         self.status = format!("Ошибка сканирования: {}", err);
@@ -599,33 +680,80 @@ impl MusicPlayerApp {
     /// Проверка результата фонового восстановления треков из прошлой сессии.
     /// Отдельный канал от сканирования — не мешает обычному выбору папки.
     fn update_restore(&mut self) {
-        let result = self
-            .restore_receiver
-            .as_ref()
-            .map(|receiver| receiver.try_recv());
-
-        match result {
-            Some(Ok(tracks)) => {
-                self.restore_receiver = None;
-                let count = tracks.len();
-                self.tracks = tracks;
-                self.status = format!("Восстановлено треков из прошлой сессии: {}", count);
-            }
-            Some(Err(mpsc::TryRecvError::Empty)) => {}
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.restore_receiver = None;
-            }
-            None => {}
+        if self.restore_receiver.is_none() {
+            return;
         }
+
+        let mut added = 0usize;
+        let mut finished = false;
+
+        if let Some(receiver) = &self.restore_receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(track) => {
+                        self.tracks.push(track);
+                        added += 1;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if finished {
+            self.restore_receiver = None;
+            self.finalize_restore();
+            // Сразу фиксируем восстановленный список на диске.
+            self.save_state_if_changed();
+            if added > 0 {
+                self.status = format!(
+                    "Восстановлено треков из прошлой сессии: {}",
+                    self.tracks.len()
+                );
+            }
+        }
+    }
+
+    /// Подводит итог восстановлению: пути прошлой сессии, которые так и не
+    /// стали треками, запоминаем как недоступные и возвращаем при сохранении.
+    fn finalize_restore(&mut self) {
+        if self.saved_playlist_paths.is_empty() {
+            return;
+        }
+
+        let restored: HashSet<&Path> = self
+            .tracks
+            .iter()
+            .map(|track| track.path.as_path())
+            .collect();
+        let missing: Vec<PathBuf> = self
+            .saved_playlist_paths
+            .iter()
+            .filter(|path| !restored.contains(path.as_path()))
+            .cloned()
+            .collect();
+
+        self.missing_playlist_paths.extend(missing);
+        self.saved_playlist_paths.clear();
     }
 
     /// Текущее состояние приложения в виде структуры для сохранения.
     fn saved_state_snapshot(&self) -> SavedState {
+        let mut track_paths: Vec<PathBuf> =
+            self.tracks.iter().map(|t| t.path.clone()).collect();
+        // Недоступные сейчас файлы (отключённый диск, сеть) дописываем в
+        // конец: иначе первое же сохранение вычистит их из плейлиста.
+        track_paths.extend(self.missing_playlist_paths.iter().cloned());
+
         SavedState {
-            track_paths: self.tracks.iter().map(|t| t.path.clone()).collect(),
+            track_paths,
             tray_enabled: self.tray_enabled,
             volume: self.volume,
             ui_scale: self.ui_scale,
+            last_opened_dir: self.last_opened_dir.clone(),
         }
     }
 
@@ -641,6 +769,9 @@ impl MusicPlayerApp {
         snapshot.tray_enabled.hash(&mut hasher);
         snapshot.volume.to_bits().hash(&mut hasher);
         snapshot.ui_scale.to_bits().hash(&mut hasher);
+        // Без этого смена только last_opened_dir не считалась изменением,
+        // и save_state_if_changed() молча ничего не писал.
+        snapshot.last_opened_dir.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -648,6 +779,13 @@ impl MusicPlayerApp {
     /// логирует в stderr. Используется в Drop, при сворачивании в трей и
     /// при выходе через меню трея.
     fn save_state_now(&mut self) {
+        // Пока восстановление не закончено, `tracks` — только часть
+        // прошлого плейлиста; запись затёрла бы остаток (старый state.json
+        // в этом случае цел, это лучше частичного списка).
+        if self.restore_receiver.is_some() {
+            return;
+        }
+
         let snapshot = self.saved_state_snapshot();
         let signature = Self::state_signature(&snapshot);
 
@@ -740,6 +878,28 @@ impl MusicPlayerApp {
 
         self.sidebar_rect = panel_response.response.rect;
     }
+
+    /// Создаёт иконку трея, если её ещё нет.
+    ///
+    /// Трей создаётся при старте независимо от галочки, но создание может
+    /// не удаться (нет прав в текущей среде) — тогда при включении галочки
+    /// и при закрытии окна пробуем создать её заново.
+    /// Возвращает, есть ли иконка после попытки.
+    fn ensure_tray(&mut self) -> bool {
+        if self.tray.is_some() {
+            return true;
+        }
+
+        let (tray, show_item_id, quit_item_id) = crate::create_tray();
+        if let (Some(show_id), Some(quit_id)) = (show_item_id, quit_item_id)
+            && let Ok(mut ids) = self.menu_item_ids.lock()
+        {
+            *ids = Some((show_id, quit_id));
+        }
+        self.tray = tray;
+        self.tray.is_some()
+    }
+
     /// Тёмный фрейм для модальных окон (настройки, предупреждения) — вместо
     /// стандартного светло-серого egui::Window.
     fn settings_window_frame(scale: f32) -> egui::Frame {
@@ -854,7 +1014,26 @@ impl MusicPlayerApp {
                     ui.horizontal(|ui| {
                         if ui.button("Да").clicked() {
                             self.tray_enabled = true;
+                            // Иконки могло не быть (создание при старте не
+                            // удалось) — создаём на лету.
+                            if !self.ensure_tray() {
+                                // Молча закрываться при крестике — худший
+                                // вариант: объясняем, почему прятать некуда.
+                                rfd::MessageDialog::new()
+                                    .set_level(rfd::MessageLevel::Warning)
+                                    .set_title("Endless Dream")
+                                    .set_description(
+                                        "Не удалось создать иконку трея: Windows ответила \
+                                         «Отказано в доступе» (ошибка 5). Так бывает, \
+                                         когда программа запущена с пониженной \
+                                         целостностью (Low IL) — например, .exe лежит в \
+                                         папке, помеченной как Low, или запущен внутри \
+                                         песочницы. Пока иконки нет, крестик закрывает окно.",
+                                    )
+                                    .show();
+                            }
                             self.pending_tray_warning = false;
+                            self.save_state_if_changed();
                         }
                         if ui.button("Отмена").clicked() {
                             self.pending_tray_warning = false;
@@ -865,7 +1044,6 @@ impl MusicPlayerApp {
     }
 
     fn render_track_table(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
         let mut clicked_index: Option<usize> = None;
         let mut double_clicked_index: Option<usize> = None;
         let mut delete_index: Option<usize> = None;
@@ -873,6 +1051,7 @@ impl MusicPlayerApp {
         let scale = self.ui_scale.clamp(0.5, 2.0);
         let current_track = self.current_track;
         let selected_track = self.selected_track;
+        let restoring = self.restore_receiver.is_some();
         // Заимствование, а не клонирование: Vec<Track> не копируется ни разу
         // за кадр, даже при больших библиотеках.
         let tracks = &self.tracks;
@@ -891,22 +1070,36 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
 
                 // Пиксельные звёзды рисуются под таблицей: координаты стабильны,
                 // меняется только их яркость, а комета движется по времени.
+                // Звёзды рисуются ПОД таблицей. Если таблица занимает весь центр,
+                // они не видны — не тратим ЦП. Считаем фактическую высоту таблицы
+                // (заголовок 30*scale + N строк по 40*scale) и сравниваем с центром.
                 let star_time = ui.ctx().input(|i| i.time);
-                paint_pixel_stars(ui.painter(), ui.max_rect(), star_time);
+                let table_height = (30.0 + tracks.len() as f32 * 40.0) * scale;
+                if table_height < ui.available_height() {
+                    paint_pixel_stars(ui.painter(), ui.max_rect(), star_time);
+                }
 
                 if tracks.is_empty() {
                     ui.add_space(60.0 * scale);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("Плейлист пуст")
-                                .size(20.0 * scale)
-                                .color(MUTED_TEXT),
-                        );
-                        ui.label(
-                            egui::RichText::new("Выберите папку или добавьте файлы слева")
-                                .size(16.0 * scale)
-                                .color(MUTED_TEXT),
-                        );
+                        if restoring {
+                            ui.label(
+                                egui::RichText::new("Загрузка библиотеки…")
+                                    .size(20.0 * scale)
+                                    .color(MUTED_TEXT),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("Плейлист пуст")
+                                    .size(20.0 * scale)
+                                    .color(MUTED_TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new("Выберите папку или добавьте файлы слева")
+                                    .size(16.0 * scale)
+                                    .color(MUTED_TEXT),
+                            );
+                        }
                     });
                     return;
                 }
@@ -927,6 +1120,13 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
                     ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
                     ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
                     ui.visuals_mut().widgets.active.bg_stroke = egui::Stroke::NONE;
+
+                    // egui 0.34 по умолчанию рисует «плавающий» скроллбар:
+                    // он выезжает при наведении и сам гаснет, когда курсор
+                    // уходит. В таблице нужен постоянный непрозрачный ползунок.
+                    let mut scroll_style = egui::style::ScrollStyle::solid();
+                    scroll_style.foreground_color = true;
+                    ui.spacing_mut().scroll = scroll_style;
 
                     let scrollbar_reserve = ui.spacing().scroll.bar_inner_margin
                         + ui.spacing().scroll.bar_width
@@ -974,7 +1174,7 @@ let cover_decodes_this_frame = &mut cover_decodes_this_frame;
 
                         TableBuilder::new(ui)
                             .striped(false)
-                            .auto_shrink([true, false])
+                            .auto_shrink([false, false])
                             .sense(egui::Sense::click())
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(Column::initial(cover_column_width).resizable(false))
@@ -1224,16 +1424,22 @@ while self.cover_textures.len() > MAX_COVERS {
         if let Some(index) = double_clicked_index {
             // Ручной запуск начинает серию ошибок заново.
             self.error_streak = 0;
-            self.play_track(&ctx, index);
+            self.play_track(index);
         }
     }
 
     /// Нижняя панель: информация о треке слева, транспорт строго по центру,
     /// громкость справа. Все три зоны рассчитываются по текущей ширине окна.
     fn render_control_panel(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
         let audio_state = self.audio.get_state();
         let scale = self.ui_scale.clamp(0.5, 2.0);
+        // Обложка берётся из ленивого кэша таблицы: читать теги файла прямо
+        // здесь (UI-поток) нельзя, на больших файлах это секунды.
+        let cover_texture = self
+            .current_track
+            .and_then(|index| self.tracks.get(index))
+            .and_then(|track| self.cover_textures.get(&track.path))
+            .and_then(|(texture, _)| texture.clone());
 
         let panel_response = egui::Panel::bottom("control_panel")
             .exact_size(120.0 * scale)
@@ -1274,7 +1480,7 @@ while self.cover_textures.len() > MAX_COVERS {
                                 .min(content_height)
                                 .min((left_width * 0.38).max(1.0));
 
-                            if let Some(texture) = &self.current_cover_texture {
+                            if let Some(texture) = &cover_texture {
                                 left.add_sized(
                                     egui::vec2(cover_size, cover_size),
                                     egui::Image::new((texture.id(), egui::vec2(cover_size, cover_size))),
@@ -1324,7 +1530,18 @@ while self.cover_textures.len() > MAX_COVERS {
                                         .truncate(),
                                     );
 
-                                    if !artist.is_empty() {
+                                    // Ошибка важнее исполнителя: audio_state.error
+                                    // живёт до следующего Play, поэтому видно, почему тишина.
+                                    if let Some(error) = &audio_state.error {
+                                        info.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(error)
+                                                    .size(12.0 * layout_scale)
+                                                    .color(ERROR_TEXT),
+                                            )
+                                            .truncate(),
+                                        );
+                                    } else if !artist.is_empty() {
                                         info.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&artist)
@@ -1449,7 +1666,7 @@ while self.cover_textures.len() > MAX_COVERS {
                                 // Ручное переключение сбрасывает серию ошибок;
                                 // авто-переключение (advance_after_finish) — нет.
                                 self.error_streak = 0;
-                                self.next_track(&ctx);
+                                self.next_track();
                             }
 
                             center.add_space(4.0 * layout_scale);
@@ -1463,9 +1680,9 @@ while self.cover_textures.len() > MAX_COVERS {
                                 } else if audio_state.is_paused {
                                     self.audio.send(AudioCommand::Resume);
                                 } else if let Some(index) = self.selected_track {
-                                    self.play_track(&ctx, index);
+                                    self.play_track(index);
                                 } else if !self.tracks.is_empty() {
-                                    self.play_track(&ctx, 0);
+                                    self.play_track(0);
                                 }
                             }
 
@@ -1473,7 +1690,7 @@ while self.cover_textures.len() > MAX_COVERS {
 
                             if skip_button(center, false, 32.0 * layout_scale) {
                                 self.error_streak = 0;
-                                self.prev_track(&ctx);
+                                self.prev_track();
                             }
                         },
                     );
@@ -1526,23 +1743,22 @@ if volume_response.dragged() || volume_response.clicked() {
 impl eframe::App for MusicPlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // ДИАГНОСТИКА (временно): состояние окна только когда есть повод —
-        // иначе запись в файл на каждом кадре тормозит UI-поток.
-        let close_requested_now = ctx.input(|i| i.viewport().close_requested());
-        if close_requested_now || self.quitting {
-            debug_log(&format!(
-                "[pid={}] CLOSE: close_requested={} visible={:?} minimized={:?} \
-                 focused={} tray={} enabled={} quitting={}",
-                std::process::id(),
-                close_requested_now,
-                ctx.input(|i| i.viewport().visible()),
-                ctx.input(|i| i.viewport().minimized),
-                ctx.input(|i| i.focused),
-                self.tray.is_some(),
-                self.tray_enabled,
-                self.quitting,
-            ));
+
+        // Иконка окна (и кнопки на панели задач). eframe ставит её только
+        // когда окно активно (GetActiveWindow), а при запуске из терминала
+        // окно открывается без фокуса — тогда кнопка остаётся с пустой
+        // иконкой. Ставим сами по PID; повторяем, пока окно не появится.
+        #[cfg(target_os = "windows")]
+        if !self.icon_applied
+            && let Some(icon) = &self.window_icon
+        {
+            self.icon_applied = crate::apply_window_icon(icon);
         }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.icon_applied = true;
+        }
+
         // Гасим белые tooltip'ы: тёмный фон в стиле приложения.
         // В egui 0.34 tooltip берёт цвета из Style::visuals, но не все
         // переопределения из main.rs долетают до него (Frame::popup
@@ -1583,17 +1799,33 @@ impl eframe::App for MusicPlayerApp {
             })
             .unwrap_or((false, false));
 
-        // Крестик.
+        // Крестик: состояние фиксируем сразу, до скрытия в трей или выхода.
+        // Если трей включён, но иконки нет (не удалось создать при старте),
+        // пробуем создать её ещё раз — без иконки прятать окно некуда.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && self.tray.is_some() && self.tray_enabled && !self.quitting {
-            debug_log("before CancelClose");
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            debug_log("before Visible(false)");
+        if close_requested && !self.quitting {
+            if self.tray_enabled {
+                self.ensure_tray();
+            }
+            self.save_state_now();
+            if self.tray_enabled && self.tray.is_some() {
+                // ВАЖНО: CancelClose и Visible(false) нельзя отправлять одним
+                // пакетом в кадре, который реагирует на только что пришедшее
+                // системное событие закрытия — на некоторых бэкендах (winit)
+                // Visible(false) в этом случае теряется, и окно остаётся
+                // открытым, будто клика не было (чаще всего это видно именно
+                // на первом закрытии после старта, пока очередь viewport-команд
+                // ещё не "устоялась"). Поэтому в этом кадре только отменяем
+                // закрытие, а прячем окно уже на СЛЕДУЮЩЕМ кадре.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending_hide_to_tray = true;
+                ctx.request_repaint();
+            }
+        }
+
+        if self.pending_hide_to_tray {
+            self.pending_hide_to_tray = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            // Сворачивание в трей не завершает процесс — Drop ещё не
-            // вызовется, поэтому сохраняем явно, здесь единственный шанс.
-            // self.save_state_now();  // TEMP: тест, не блокировать UI
-            debug_log("after close handling");
         }
 
         if want_show {
@@ -1631,7 +1863,7 @@ impl eframe::App for MusicPlayerApp {
         if let Some(error) = &audio_state.error {
             self.status = error.clone();
         }
-        self.check_track_finished(&ctx, &audio_state);
+        self.check_track_finished(&audio_state);
     // Правка А: пересчитываем стиль только при изменении ui_scale,
         // а не каждый кадр. base_style — кастомный стиль из main.rs.
 
@@ -1651,20 +1883,28 @@ impl eframe::App for MusicPlayerApp {
         self.render_control_panel(ui);
         self.render_track_table(ui);
 
-                let (visible, minimized) = ctx.input(|i| {
+
+        let (visible, minimized) = ctx.input(|i| {
             let vp = i.viewport();
             (vp.visible().unwrap_or(true), vp.minimized.unwrap_or(false))
         });
+
         let window_shown = visible && !minimized;
-        let audio_active = audio_state.is_playing || audio_state.is_paused;
-                let repaint_ms = if !window_shown {
-            1000
-        } else if audio_active {
-            16
+        let now = ctx.input(|i| i.time);
+
+        // Комета должна получать плавные 60 FPS даже при остановленной музыке.
+        let comet_active = pixel_comet_progress(now).is_some();
+
+        // 16 мс — пока летит комета, 50 мс — обычная работа, 1 с — окно скрыто.
+        let repaint_delay = if !window_shown {
+            Duration::from_secs(1)
+        } else if comet_active {
+            Duration::from_millis(16)
         } else {
-            33
+            Duration::from_millis(50)
         };
-                ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+        ctx.request_repaint_after(repaint_delay);
+
 
         use egui::emath::GuiRounding as _;
 
@@ -1700,6 +1940,12 @@ impl eframe::App for MusicPlayerApp {
             let left_x = self.sidebar_rect.right().min(self.control_panel_rect.left());
             painter.hline(left_x..=self.control_panel_rect.right(), split_y, line_stroke);
         }
+    }
+
+    /// Штатное завершение (крестик без трея, выход ОС): сохраняем состояние,
+    /// не полагаясь только на 30-секундный таймер и `Drop`.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_state_now();
     }
 }
 impl Drop for MusicPlayerApp {
