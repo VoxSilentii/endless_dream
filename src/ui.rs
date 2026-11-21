@@ -1738,6 +1738,137 @@ if volume_response.dragged() || volume_response.clicked() {
 
         self.control_panel_rect = panel_response.response.rect;
     }
+
+    /// Глобальные горячие клавиши плеера.
+    ///
+    /// Вызывается из `ui()` после `check_track_finished` и до отрисовки
+    /// панелей. `consume_key` выкупает события из `InputState`, поэтому
+    /// сфокусированные виджеты их уже не получат — двойного срабатывания
+    /// (например, Space на сфокусированной кнопке) не будет.
+    fn handle_hotkeys(&mut self, ctx: &egui::Context, audio_state: &AudioState) {
+        // В текстовом поле (поиск, имя плейлиста) клавиши принадлежат полю.
+        // Проверяем именно TextEdit, а не любой фокус: после клика по строке
+        // таблицы фокус тоже есть, но Space/Del должны работать.
+        if ctx.text_edit_focused() {
+            return;
+        }
+
+        // В открытых настройках/предупреждении не перехватываем Space:
+        // иначе нельзя будет активировать кнопки с клавиатуры.
+        if self.show_settings || self.pending_tray_warning {
+            return;
+        }
+
+        // Space: play/pause. Повтор игнорируем — иначе удержание клавиши
+        // будет многократно переключать воспроизведение.
+        if consume_key(ctx, egui::Modifiers::NONE, egui::Key::Space, false) {
+            self.error_streak = 0;
+            if audio_state.is_playing {
+                self.audio.send(AudioCommand::Pause);
+            } else if audio_state.is_paused {
+                self.audio.send(AudioCommand::Resume);
+            } else if let Some(index) = self.selected_track {
+                self.play_track(index);
+            } else if !self.tracks.is_empty() {
+                self.play_track(0);
+            }
+        }
+
+        // Ctrl+←/→: предыдущий/следующий трек. Повтор разрешён: удержание
+        // стрелки удобно листает треки.
+        if consume_key(
+            ctx,
+            egui::Modifiers::COMMAND,
+            egui::Key::ArrowLeft,
+            true,
+        ) {
+            self.error_streak = 0;
+            self.prev_track();
+        }
+        if consume_key(
+            ctx,
+            egui::Modifiers::COMMAND,
+            egui::Key::ArrowRight,
+            true,
+        ) {
+            self.error_streak = 0;
+            self.next_track();
+        }
+
+        // Ctrl+↑/↓: громкость шагом 5%. На диск не пишем каждый кадр —
+        // это сделает штатный 30-секундный таймер или выход.
+        let mut volume_delta = 0.0_f32;
+        if consume_key(
+            ctx,
+            egui::Modifiers::COMMAND,
+            egui::Key::ArrowUp,
+            true,
+        ) {
+            volume_delta += 0.05;
+        }
+        if consume_key(
+            ctx,
+            egui::Modifiers::COMMAND,
+            egui::Key::ArrowDown,
+            true,
+        ) {
+            volume_delta -= 0.05;
+        }
+        if volume_delta != 0.0 {
+            self.volume = (self.volume + volume_delta).clamp(0.0, 1.0);
+            self.audio.send(AudioCommand::SetVolume(self.volume));
+        }
+
+        // Delete: удалить выбранный трек. Повтор игнорируем, чтобы удержание
+        // клавиши не удаляло треки пачкой.
+        if consume_key(ctx, egui::Modifiers::NONE, egui::Key::Delete, false)
+            && let Some(index) = self.selected_track
+        {
+            self.delete_track(index);
+        }
+    }
+}
+
+/// Выкупает из очереди событий нажатие клавиши с нужными модификаторами.
+///
+/// В отличие от `InputState::consume_key`, умеет игнорировать key-repeat:
+/// событие всё равно удаляется из очереди (чтобы не досталось виджетам),
+/// но `true` возвращается только для первого нажатия, если `allow_repeat`
+/// выключен.
+fn consume_key(
+    ctx: &egui::Context,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+    allow_repeat: bool,
+) -> bool {
+    ctx.input_mut(|input| {
+        let mut triggered = false;
+
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key: event_key,
+                pressed: true,
+                repeat,
+                modifiers: event_modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+
+            if *event_key != key || !event_modifiers.matches_logically(modifiers) {
+                return true;
+            }
+
+            // Событие всегда выкупаем, чтобы оно не досталось виджетам.
+            if allow_repeat || !*repeat {
+                triggered = true;
+            }
+            false
+        });
+
+        triggered
+    })
 }
 
 impl eframe::App for MusicPlayerApp {
@@ -1864,6 +1995,12 @@ impl eframe::App for MusicPlayerApp {
             self.status = error.clone();
         }
         self.check_track_finished(&audio_state);
+
+        // Горячие клавиши обрабатываем после авто-переключения трека,
+        // но до отрисовки панелей: consume_key выкупает события, поэтому
+        // сфокусированные виджеты их уже не увидят.
+        self.handle_hotkeys(&ctx, &audio_state);
+
     // Правка А: пересчитываем стиль только при изменении ui_scale,
         // а не каждый кадр. base_style — кастомный стиль из main.rs.
 
@@ -2813,4 +2950,81 @@ fn draw_gear_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color:
     paint_rect(0.0, 0.0, 3.0, 3.0, bg);
     paint_rect(0.0, 0.0, 1.4, 1.4, color);
     paint_rect(0.0, 0.0, 0.5, 0.5, bg);
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::consume_key;
+    use eframe::egui;
+
+    fn key_event(key: egui::Key, repeat: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers,
+        }
+    }
+
+    /// Space не должен срабатывать на key-repeat: удержание клавиши иначе
+    /// многократно переключало бы play/pause. Повтор всё равно выкупается
+    /// из очереди, чтобы не достаться сфокусированному виджету.
+    #[test]
+    fn space_repeat_triggers_only_once() {
+        let ctx = egui::Context::default();
+        let mut triggered = 0usize;
+
+        let input = egui::RawInput {
+            events: vec![
+                key_event(egui::Key::Space, false, egui::Modifiers::NONE),
+                key_event(egui::Key::Space, true, egui::Modifiers::NONE),
+            ],
+            ..Default::default()
+        };
+
+        let _ = ctx.run_ui(input, |ui| {
+            if consume_key(ui.ctx(), egui::Modifiers::NONE, egui::Key::Space, false) {
+                triggered += 1;
+            }
+        });
+
+        assert_eq!(triggered, 1);
+    }
+
+    /// Ctrl+стрелка должна матчиться через `COMMAND`: на Windows/Linux
+    /// egui-winit выставляет и `ctrl`, и `command` одновременно.
+    #[test]
+    fn ctrl_arrow_is_consumed_with_command_modifier() {
+        let ctx = egui::Context::default();
+        let mut triggered = 0usize;
+
+        let windows_ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+
+        let input = egui::RawInput {
+            events: vec![key_event(
+                egui::Key::ArrowRight,
+                false,
+                windows_ctrl,
+            )],
+            ..Default::default()
+        };
+
+        let _ = ctx.run_ui(input, |ui| {
+            if consume_key(
+                ui.ctx(),
+                egui::Modifiers::COMMAND,
+                egui::Key::ArrowRight,
+                true,
+            ) {
+                triggered += 1;
+            }
+        });
+
+        assert_eq!(triggered, 1);
+    }
 }

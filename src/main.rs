@@ -531,9 +531,14 @@ fn spawn_show_signal_listener(
         return;
     }
 
+    // HANDLE — сырой указатель (`*mut c_void`), а `std::thread::spawn`
+    // требует Send. Передаём его как usize: поток живёт до конца процесса,
+    // и закрывать handle из другого потока не нужно.
+    let handle = handle as usize;
+
     std::thread::spawn(move || loop {
         // WAIT_OBJECT_0 == 0.
-        if unsafe { WaitForSingleObject(handle, INFINITE) } != 0 {
+        if unsafe { WaitForSingleObject(handle as _, INFINITE) } != 0 {
             break;
         }
         if let Ok(mut req) = tray_requests.lock() {
